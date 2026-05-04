@@ -799,4 +799,60 @@ mod tests {
         assert!(collision.canonical_ids.contains(&"claude/shared-id".to_string()));
         assert!(collision.canonical_ids.contains(&"codex/shared-id".to_string()));
     }
+
+    // ===================== Archive Integrity (bd-28jh) =====================
+
+    #[test]
+    fn test_compute_dir_hash_deterministic() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "hello world").unwrap();
+        fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+        let hash1 = compute_dir_hash(dir.path()).unwrap();
+        let hash2 = compute_dir_hash(dir.path()).unwrap();
+        assert_eq!(hash1, hash2, "hash should be deterministic");
+        assert_eq!(hash1.len(), 64); // Blake3 hex
+    }
+
+    #[test]
+    fn test_compute_dir_hash_detects_content_change() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        fs::write(dir_a.path().join("SKILL.md"), "original").unwrap();
+        fs::write(dir_b.path().join("SKILL.md"), "modified").unwrap();
+
+        let hash_a = compute_dir_hash(dir_a.path()).unwrap();
+        let hash_b = compute_dir_hash(dir_b.path()).unwrap();
+        assert_ne!(hash_a, hash_b, "hash should differ on content change");
+    }
+
+    #[test]
+    fn test_build_archived_assets_preserves_scripts_and_refs() {
+        let scripts: Vec<PathBuf> = vec![
+            PathBuf::from("scripts/run.sh"),
+            PathBuf::from("scripts/setup.sh"),
+        ];
+        let refs: Vec<PathBuf> = vec![
+            PathBuf::from("references/readme.md"),
+            PathBuf::from("references/api.yaml"),
+        ];
+        let assets = build_archived_assets(&scripts, &refs);
+
+        assert_eq!(assets.scripts.len(), 2);
+        assert_eq!(assets.references.len(), 2);
+        assert_eq!(assets.tests.len(), 0);
+
+        assert_eq!(assets.scripts[0].path, PathBuf::from("scripts/run.sh"));
+        assert_eq!(assets.scripts[1].path, PathBuf::from("scripts/setup.sh"));
+        assert_eq!(assets.references[0].path, PathBuf::from("references/readme.md"));
+        assert_eq!(assets.references[1].path, PathBuf::from("references/api.yaml"));
+    }
+
+    #[test]
+    fn test_build_archived_assets_handles_empty() {
+        let assets = build_archived_assets(&[], &[]);
+        assert!(assets.scripts.is_empty());
+        assert!(assets.references.is_empty());
+        assert!(assets.tests.is_empty());
+    }
 }
