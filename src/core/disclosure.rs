@@ -16,7 +16,7 @@ use super::slicing::SkillSlicer;
 // =============================================================================
 
 /// Disclosure level for skill loading
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum DisclosureLevel {
@@ -30,6 +30,9 @@ pub enum DisclosureLevel {
     Full,
     /// Level 4: Full content + scripts + references (5000+ tokens)
     Complete,
+    /// Load only a specific section by slug.
+    /// Section content is extracted and returned as the body.
+    Section(String),
     /// Auto-select based on context
     #[default]
     Auto,
@@ -45,6 +48,7 @@ impl DisclosureLevel {
             Self::Standard => Some(1500),
             Self::Full => None,
             Self::Complete => None,
+            Self::Section(_) => None,
             Self::Auto => None,
         }
     }
@@ -65,14 +69,15 @@ impl DisclosureLevel {
 
     /// Get human-readable name
     #[must_use]
-    pub const fn name(&self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Self::Minimal => "minimal",
-            Self::Overview => "overview",
-            Self::Standard => "standard",
-            Self::Full => "full",
-            Self::Complete => "complete",
-            Self::Auto => "auto",
+            Self::Minimal => "minimal".to_string(),
+            Self::Overview => "overview".to_string(),
+            Self::Standard => "standard".to_string(),
+            Self::Full => "full".to_string(),
+            Self::Complete => "complete".to_string(),
+            Self::Section(slug) => format!("section:{slug}"),
+            Self::Auto => "auto".to_string(),
         }
     }
 
@@ -85,9 +90,47 @@ impl DisclosureLevel {
             Self::Standard => 2,
             Self::Full => 3,
             Self::Complete => 4,
-            Self::Auto => 2, // Default to standard for comparison
+            Self::Section(_) => 3, // Treat sections as full content of that section
+            Self::Auto => 2,       // Default to standard for comparison
         }
     }
+}
+
+// =============================================================================
+// SECTION SLUGS
+// =============================================================================
+
+/// Sanitize a section title into a kebab-case slug.
+///
+/// Rules:
+/// - Lowercase ASCII
+/// - Replace whitespace and underscores with `-`
+/// - Remove non-alphanumeric chars (except `-`)
+/// - Collapse adjacent `-` separators
+/// - Trim leading/trailing `-`
+#[must_use]
+pub fn sanitize_slug(input: &str) -> String {
+    let slug: String = input
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+            ' ' | '_' | '-' => '-',
+            _ => '-',
+        })
+        .collect();
+
+    // Collapse adjacent dashes
+    let collapsed: String = slug.chars().fold(String::new(), |mut acc, c| {
+        if c == '-' && acc.ends_with('-') {
+            // skip duplicate
+        } else {
+            acc.push(c);
+        }
+        acc
+    });
+
+    // Trim leading and trailing dashes
+    collapsed.trim_matches('-').to_string()
 }
 
 // =============================================================================
@@ -289,7 +332,7 @@ pub enum RequestType {
 #[must_use]
 pub fn disclose(spec: &SkillSpec, assets: &SkillAssets, plan: &DisclosurePlan) -> DisclosedContent {
     match plan {
-        DisclosurePlan::Level(level) => disclose_level(spec, assets, *level),
+        DisclosurePlan::Level(level) => disclose_level(spec, assets, level.clone()),
         DisclosurePlan::Pack(budget) => disclose_packed(spec, assets, budget),
     }
 }
@@ -301,7 +344,7 @@ pub fn disclose_level(
     assets: &SkillAssets,
     level: DisclosureLevel,
 ) -> DisclosedContent {
-    match level {
+    match &level {
         DisclosureLevel::Minimal => {
             let frontmatter = minimal_frontmatter(&spec.metadata);
             DisclosedContent {
@@ -310,7 +353,7 @@ pub fn disclose_level(
                 scripts: vec![],
                 references: vec![],
                 token_estimate: estimate_tokens_frontmatter(&spec.metadata, true),
-                level,
+                level: level.clone(),
                 slices_included: None,
             }
         }
@@ -325,7 +368,7 @@ pub fn disclose_level(
                 scripts: vec![],
                 references: vec![],
                 token_estimate,
-                level,
+                level: level.clone(),
                 slices_included: None,
             }
         }
@@ -341,7 +384,7 @@ pub fn disclose_level(
                 scripts: vec![],
                 references: vec![],
                 token_estimate,
-                level,
+                level: level.clone(),
                 slices_included: None,
             }
         }
@@ -353,10 +396,10 @@ pub fn disclose_level(
             DisclosedContent {
                 frontmatter,
                 body,
-                scripts: vec![],
-                references: vec![],
+                scripts: assets.scripts.clone(),
+                references: assets.references.clone(),
                 token_estimate,
-                level,
+                level: level.clone(),
                 slices_included: None,
             }
         }
@@ -372,7 +415,7 @@ pub fn disclose_level(
                 scripts: assets.scripts.clone(),
                 references: assets.references.clone(),
                 token_estimate,
-                level,
+                level: level.clone(),
                 slices_included: None,
             }
         }
@@ -380,7 +423,66 @@ pub fn disclose_level(
             // Default to Standard for Auto
             disclose_level(spec, assets, DisclosureLevel::Standard)
         }
+        DisclosureLevel::Section(slug) => disclose_section(spec, assets, slug, level.clone()),
     }
+}
+
+/// Disclose only a specific section matched by slug.
+fn disclose_section(
+    spec: &SkillSpec,
+    _assets: &SkillAssets,
+    slug: &str,
+    level: DisclosureLevel,
+) -> DisclosedContent {
+    let frontmatter = DisclosedFrontmatter::from(&spec.metadata);
+
+    // Find the section whose title matches the slug
+    let matched_section = spec.sections.iter().find(|section| {
+        let section_slug = sanitize_slug(&section.title);
+        section_slug == slug
+    });
+
+    match matched_section {
+        Some(section) => {
+            let body = render_single_section(section);
+            let token_estimate = estimate_tokens_frontmatter(&spec.metadata, false)
+                + estimate_tokens_body(Some(&body));
+            DisclosedContent {
+                frontmatter,
+                body: Some(body),
+                scripts: vec![],
+                references: vec![],
+                token_estimate,
+                level,
+                slices_included: None,
+            }
+        }
+        None => {
+            // Section not found - return minimal with a note in body
+            DisclosedContent {
+                frontmatter,
+                body: Some(format!("*Section '{slug}' not found in this skill.*")),
+                scripts: vec![],
+                references: vec![],
+                token_estimate: estimate_tokens_frontmatter(&spec.metadata, false) + 10,
+                level,
+                slices_included: None,
+            }
+        }
+    }
+}
+
+/// Render a single section to markdown
+fn render_single_section(section: &SkillSection) -> String {
+    let mut out = String::new();
+    out.push_str("## ");
+    out.push_str(&section.title);
+    out.push_str("\n\n");
+    for block in &section.blocks {
+        out.push_str(&block.content);
+        out.push_str("\n\n");
+    }
+    out
 }
 
 /// Pack content within a token budget
@@ -496,8 +598,8 @@ fn render_packed_body(slices: &[crate::core::skill::SkillSlice]) -> String {
 #[must_use]
 pub fn optimal_disclosure(context: &DisclosureContext) -> DisclosurePlan {
     // If explicitly requested, use that level
-    if let Some(level) = context.explicit_level {
-        return DisclosurePlan::Level(level);
+    if let Some(level) = &context.explicit_level {
+        return DisclosurePlan::Level((*level).clone());
     }
 
     // If a token budget is specified, use packing
@@ -811,6 +913,104 @@ mod tests {
         let body = "## Section 1\n\nContent here.\n\n## Section 2\n\nMore content.";
         let truncated = truncate_examples(body, 10); // Very small budget
         assert!(truncated.contains("[... truncated ...]"));
+    }
+
+    #[test]
+    fn test_disclosure_level_section_variant() {
+        let section = DisclosureLevel::Section("checklist".to_string());
+        assert_eq!(section.level_num(), 3);
+        assert_eq!(section.name(), "section:checklist");
+        assert!(section.token_budget().is_none());
+    }
+
+    #[test]
+    fn test_disclosure_level_section_from_str() {
+        // Section slugs are NOT parsed from level strings -- they come from --section flag
+        assert_eq!(DisclosureLevel::from_str_or_level("checklist"), None);
+    }
+
+    #[test]
+    fn test_sanitize_slug_basic() {
+        assert_eq!(sanitize_slug("Checklist"), "checklist");
+        assert_eq!(sanitize_slug("Rust Error Handling"), "rust-error-handling");
+        assert_eq!(sanitize_slug("  Spaces  "), "spaces");
+    }
+
+    #[test]
+    fn test_sanitize_slug_special_chars() {
+        assert_eq!(sanitize_slug("Hello_World"), "hello-world");
+        assert_eq!(sanitize_slug("What's New?"), "what-s-new");
+        assert_eq!(sanitize_slug("Price: $100"), "price-100");
+    }
+
+    #[test]
+    fn test_sanitize_slug_collapse_adjacent() {
+        assert_eq!(sanitize_slug("a___b"), "a-b");
+        assert_eq!(sanitize_slug("a---b"), "a-b");
+    }
+
+    #[test]
+    fn test_sanitize_slug_trim() {
+        assert_eq!(sanitize_slug("--hello--"), "hello");
+        assert_eq!(sanitize_slug("-a-"), "a");
+    }
+
+    #[test]
+    fn test_sanitize_slug_empty() {
+        assert_eq!(sanitize_slug(""), "");
+        assert_eq!(sanitize_slug("---"), "");
+    }
+
+    #[test]
+    fn test_disclose_level_section_found() {
+        let spec = SkillSpec {
+            metadata: SkillMetadata {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                version: "1.0".to_string(),
+                description: "Test skill".to_string(),
+                ..Default::default()
+            },
+            sections: vec![
+                SkillSection {
+                    id: "intro".to_string(),
+                    title: "Introduction".to_string(),
+                    blocks: vec![],
+                },
+                SkillSection {
+                    id: "checklist".to_string(),
+                    title: "Checklist".to_string(),
+                    blocks: vec![crate::core::skill::SkillBlock {
+                        id: "c1".to_string(),
+                        block_type: crate::core::skill::BlockType::Checklist,
+                        content: "- [ ] Do the thing".to_string(),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let assets = SkillAssets::default();
+        let plan = DisclosurePlan::Level(DisclosureLevel::Section("checklist".to_string()));
+        let content = disclose(&spec, &assets, &plan);
+        assert_eq!(content.frontmatter.name, "Test");
+        assert!(content.body.as_deref().unwrap_or("").contains("Checklist"));
+        assert!(
+            content
+                .body
+                .as_deref()
+                .unwrap_or("")
+                .contains("Do the thing")
+        );
+        assert_eq!(content.level.name(), "section:checklist");
+    }
+
+    #[test]
+    fn test_disclose_level_section_not_found() {
+        let spec = SkillSpec::new("test", "Test");
+        let assets = SkillAssets::default();
+        let plan = DisclosurePlan::Level(DisclosureLevel::Section("nonexistent".to_string()));
+        let content = disclose(&spec, &assets, &plan);
+        assert!(content.body.as_deref().unwrap_or("").contains("not found"));
     }
 
     #[test]

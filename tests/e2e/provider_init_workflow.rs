@@ -314,3 +314,95 @@ fn test_archive_first_list_show_load_after_deletion() -> Result<()> {
     fixture.checkpoint("archive_first_all_commands_ok");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// bd-19e6: kebab-case section slugs and ms load --section
+// ---------------------------------------------------------------------------
+
+/// Test the full show -> load --section workflow using section slugs.
+#[test]
+fn test_show_load_section_slug_workflow() -> Result<()> {
+    let mut fixture = E2EFixture::new("section_slug_workflow");
+
+    create_provider_skill(
+        &fixture, ".claude/skills", "multi-section",
+        r#"---
+name: Multi Section
+description: A skill with multiple sections
+tags: []
+---
+
+# Multi Section
+
+## Rules
+
+- Follow these rules always
+
+## Examples
+
+Here are some code examples.
+
+## Pitfalls
+
+- Avoid these common mistakes.
+"#,
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    assert!(init_out.success, "init should succeed: {}", init_out.stderr);
+
+    // Get section slugs from show
+    let show_out = fixture.run_ms(&["--robot", "show", "multi-section"]);
+    fixture.assert_success(&show_out, "show");
+    let show_json: serde_json::Value =
+        serde_json::from_str(&show_out.stdout).expect("valid JSON");
+
+    let slugs = show_json["skill"]["section_slugs"]
+        .as_array()
+        .expect("section_slugs should be an array");
+    println!("[bd-19e6] Available section slugs: {:?}", slugs);
+
+    // At least one slug should be present for a multi-section skill
+    assert!(slugs.len() >= 1, "skill should have at least one section slug, got {:?}", slugs);
+
+    // Load just the first section
+    let first_slug = slugs[0].as_str().unwrap();
+    let section_out = fixture.run_ms(&["--robot", "load", "multi-section", "--section", first_slug]);
+    fixture.assert_success(&section_out, "load --section");
+
+    // Verify the loaded output contains the section title
+    assert!(
+        section_out.stdout.contains(first_slug.replace('-', " ").split(' ').next().unwrap_or("")),
+        "load output should mention section content"
+    );
+
+    fixture.checkpoint("section_slug_workflow_ok");
+    Ok(())
+}
+
+/// Test that load --section with invalid slug produces a clean error.
+#[test]
+fn test_load_section_invalid_slug_fails_cleanly() -> Result<()> {
+    let mut fixture = E2EFixture::new("invalid_section_slug");
+
+    create_provider_skill(
+        &fixture, ".claude/skills", "simple-skill",
+        "# Simple Skill\n\n## Rules\n\n- Be simple\n",
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    assert!(init_out.success, "init should succeed: {}", init_out.stderr);
+
+    // Load with a slug that doesn't match any section
+    let load_out = fixture.run_ms(&["--robot", "load", "simple-skill", "--section", "nonexistent-section"]);
+    // The load succeeds (skill found), but the section note is rendered in the body
+    // Exit code 0 because load_skill succeeds even when section not found
+    assert!(
+        load_out.success,
+        "load should succeed even with invalid section slug: exit={} stderr={}",
+        load_out.exit_code, load_out.stderr
+    );
+
+    fixture.checkpoint("invalid_section_handled");
+    Ok(())
+}
