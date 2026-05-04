@@ -79,6 +79,63 @@ If data was lost, check these locations for recovery:
 
 ---
 
+## Route + Load Workflow (tl;dr)
+
+When working with skills, prefer `route` then `load`:
+
+```bash
+ms route "error handling"          # route to best skill ID or section slug
+ms load <canonical-id>             # load full skill content
+ms load <canonical-id> --section X # load one section
+ms compress <skill>                # compact summary + rehydrate hints
+```
+
+Rules: `ms init` auto-discovers skills. Archive backs everything. Deleting a provider folder does not break `show`/`load`/`route` — the archive retains copies.
+
+---
+
+## Route-First Workflow (Agent Primary Loop)
+
+The agent MUST follow this workflow for every non-trivial task:
+
+### Step 1: Route First
+```bash
+ms route "<current task>" -O json
+```
+Always use `-O json` for machine-readable output. The route response contains:
+- `decision`: `"match"` or `"no_match"`
+- `candidates[]`: Array of matched skills with scores
+- `load_command`: Exact command to run (e.g., `ms load claude/rust-errors --section patterns`)
+
+### Step 2: Load Minimal
+If candidates exist, run the exact `load_command` from the top candidate:
+```bash
+ms load <skill-id> --section <slug> -O json
+```
+Use `--level overview` or `--section <slug>` for minimal disclosure.
+
+### Step 3: Rehydrate Only If Needed
+If the initial load is insufficient, use:
+- The `entry_sections` array from route response for next sections
+- `ms load <skill-id> --section <next-section>`
+- The `default_load` field for recommended disclosure level
+
+### Step 4: Fallback
+Only if `route` returns `decision: "no_match"`:
+```bash
+ms search "<task>" -O json    # Hybrid search
+ms list --tags <relevant>      # Filter by tags
+ms show <skill-id>            # Full skill details
+```
+
+### Key Constraints
+- **ALWAYS route first** — do not browse skills with `list`/`show` upfront
+- **Use exact `load_command`** — the command in route response is the canonical minimal load
+- **Archive survives deletion** — deleting provider folders does NOT break `load`/`route`
+- **Negative route cache** — repeated no-match queries are cached; invalidate with `ms providers sync`
+
+---
+
 ## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
@@ -89,20 +146,11 @@ If data was lost, check these locations for recovery:
 
 ---
 
-## Git Branch: ONLY Use `main`, NEVER `master`
+## Git Branch: ONLY Use `main`
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
-
-- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
-
-**If you see `master` referenced anywhere:**
-1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+**The default and only branch is `main`.**
+- All work happens on `main` — commits, PRs, feature branches all merge to `main`
+- `master` no longer exists — do not create or reference it
 
 ---
 
