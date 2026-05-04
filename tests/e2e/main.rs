@@ -30,3 +30,5 @@ mod skill_discovery;
 mod suggestions_workflow;
 mod sync_workflow;
 mod template_workflow;
+mod verification_suite;
+mod provider_init_workflow;

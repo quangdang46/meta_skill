@@ -165,15 +165,23 @@ fn init_human(target: &Path, args: &InitArgs) -> Result<()> {
     println!("{}", "OK".green());
 
     // Discover and import provider skills
-    print!("Discovering provider skills... ");
     let db = Database::open(&db_path)?;
     let archive = GitArchive::open(&archive_path)?;
     let search = SearchIndex::open(&index_path)?;
     let discovery = ProviderDiscovery::new();
-    let (discovered, collision_report) = discovery.discover()?;
-    if discovered.is_empty() {
-        println!("{}", "none found".yellow());
+    let roots = discovery.roots();
+    let existing_roots: Vec<_> = roots.iter().filter(|(p, _)| p.is_dir()).collect();
+    print!("Discovering provider skills... ");
+    if existing_roots.is_empty() {
+        println!("{}", "no provider roots found".yellow());
     } else {
+        println!("{} scanning {} provider root(s)", "OK".green(), existing_roots.len());
+        for (root, provider) in &existing_roots {
+            println!("  {} ({})", root.display(), provider);
+        }
+    }
+    let (discovered, collision_report) = discovery.discover()?;
+    if !discovered.is_empty() {
         let result = import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
         println!(
             "{} imported {} skills from providers",
@@ -241,6 +249,10 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
     let archive = GitArchive::open(&archive_path)?;
     let search = SearchIndex::open(&index_path)?;
     let discovery = ProviderDiscovery::new();
+    let provider_roots: Vec<_> = discovery.roots().iter()
+        .filter(|(p, _)| p.is_dir())
+        .map(|(p, name)| serde_json::json!({"path": p.display().to_string(), "provider": name}))
+        .collect();
     let (discovered, collision_report) = discovery.discover()?;
     let provider_count = if discovered.is_empty() {
         0
@@ -270,6 +282,7 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
             "archive": archive_path.display().to_string(),
             "index": index_path.display().to_string(),
             "config": config_path.display().to_string(),
+            "provider_roots_scanned": provider_roots.len(),
             "provider_skills_imported": provider_count,
         })
     );
