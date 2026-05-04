@@ -261,3 +261,56 @@ fn test_import_stores_integrity_metadata() -> Result<()> {
     fixture.checkpoint("integrity_metadata_stored");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// bd-1jq2: Archive-first registry for list/show/load
+// ---------------------------------------------------------------------------
+
+/// Test that list, show, and load all work after provider folder deletion.
+#[test]
+fn test_archive_first_list_show_load_after_deletion() -> Result<()> {
+    let mut fixture = E2EFixture::new("archive_first_all_commands");
+
+    // Create a provider skill
+    create_provider_skill(
+        &fixture, ".claude/skills", "archive-test",
+        "# Archive Test\n\n## Rules\n\n- This skill should work via archive after deletion\n",
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    assert!(init_out.success, "init should succeed: {}", init_out.stderr);
+
+    // Verify list shows the skill
+    let list_out = fixture.run_ms(&["--robot", "list"]);
+    fixture.assert_success(&list_out, "list before deletion");
+    fixture.assert_output_contains(&list_out, "archive-test");
+
+    // Verify show works
+    let show_out = fixture.run_ms(&["--robot", "show", "archive-test"]);
+    fixture.assert_success(&show_out, "show before deletion");
+
+    // Verify load works
+    let load_out = fixture.run_ms(&["--robot", "load", "archive-test"]);
+    fixture.assert_success(&load_out, "load before deletion");
+    assert!(load_out.stdout.contains("Archive Test"));
+
+    // Delete the provider folder
+    std::fs::remove_dir_all(fixture.root.join(".claude/skills"))?;
+
+    // list should still work
+    let list_after = fixture.run_ms(&["--robot", "list"]);
+    fixture.assert_success(&list_after, "list after deletion");
+    fixture.assert_output_contains(&list_after, "archive-test");
+
+    // show should still work
+    let show_after = fixture.run_ms(&["--robot", "show", "archive-test"]);
+    fixture.assert_success(&show_after, "show after deletion");
+
+    // load should still work
+    let load_after = fixture.run_ms(&["--robot", "load", "archive-test"]);
+    fixture.assert_success(&load_after, "load after deletion");
+    assert!(load_after.stdout.contains("Archive Test"));
+
+    fixture.checkpoint("archive_first_all_commands_ok");
+    Ok(())
+}
