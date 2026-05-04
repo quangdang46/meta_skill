@@ -66,6 +66,9 @@ fn arb_skill_metadata() -> impl Strategy<Value = SkillMetadata> {
                 license,
             )| SkillMetadata {
                 id,
+                provider: "local".to_string(),
+                canonical_id: String::new(),
+                display_id: String::new(),
                 name,
                 version,
                 description,
@@ -75,7 +78,13 @@ fn arb_skill_metadata() -> impl Strategy<Value = SkillMetadata> {
                 platforms,
                 author,
                 license,
+                source_path: None,
                 context: Default::default(),
+                trigger_phrases: vec![],
+                when_to_use: None,
+                keywords: vec![],
+                execution_mode: Default::default(),
+                entry_sections: vec![],
             },
         )
 }

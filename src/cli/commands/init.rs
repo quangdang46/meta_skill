@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use colored::Colorize;
 
+use crate::cli::commands::providers::seed_provider_sync_state;
 use crate::cli::output::OutputFormat;
 use crate::error::{MsError, Result};
+use crate::import::provider::{ProviderDiscovery, import_discovered_skills};
 use crate::search::SearchIndex;
 use crate::storage::{Database, GitArchive};
 
@@ -162,6 +164,52 @@ fn init_human(target: &Path, args: &InitArgs) -> Result<()> {
     create_default_config(&config_path, args.global, args.force)?;
     println!("{}", "OK".green());
 
+    // Discover and import provider skills
+    print!("Discovering provider skills... ");
+    let db = Database::open(&db_path)?;
+    let archive = GitArchive::open(&archive_path)?;
+    let search = SearchIndex::open(&index_path)?;
+    let discovery = ProviderDiscovery::new();
+    let (discovered, collision_report) = discovery.discover()?;
+    if discovered.is_empty() {
+        println!("{}", "none found".yellow());
+    } else {
+        let result = import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
+        println!(
+            "{} imported {} skills from providers",
+            "OK".green(),
+            result.imported.len()
+        );
+        if result.collision_report.has_collisions {
+            println!(
+                "{}: {} skill ID collision(s) detected",
+                "WARNING".yellow(),
+                result.collision_report.len()
+            );
+        }
+        if !result.errors.is_empty() {
+            for err in &result.errors {
+                eprintln!(
+                    "  warning: failed to import {}: {}",
+                    err.path.display(),
+                    err.message
+                );
+            }
+        }
+        seed_provider_sync_state(target, discovery.roots())?;
+    }
+
+    // Sync provider roots to update cache state (disabled - ctx not available in init_human)
+    // TODO: re-add sync if needed with proper context passing
+    // let sync_args = SyncArgs {
+    //     apply: true,
+    //     root: None,
+    //     verbose: false,
+    // };
+    // if let Err(e) = run_sync(ctx, &sync_args) {
+    //     eprintln!("warning: provider sync failed: {}", e);
+    // }
+
     println!();
     println!("{} Initialized at {}", "✓".green().bold(), target.display());
 
@@ -188,6 +236,31 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
     let config_path = config_path_for(target, args.global)?;
     create_default_config(&config_path, args.global, args.force)?;
 
+    // Discover and import provider skills
+    let db = Database::open(&db_path)?;
+    let archive = GitArchive::open(&archive_path)?;
+    let search = SearchIndex::open(&index_path)?;
+    let discovery = ProviderDiscovery::new();
+    let (discovered, collision_report) = discovery.discover()?;
+    let provider_count = if discovered.is_empty() {
+        0
+    } else {
+        let result = import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
+        seed_provider_sync_state(target, discovery.roots())?;
+        result.imported.len()
+    };
+
+    // Sync provider roots to update cache state (disabled - ctx not available in init_robot)
+    // TODO: re-add sync if needed with proper context passing
+    // let sync_args = SyncArgs {
+    //     apply: true,
+    //     root: None,
+    //     verbose: false,
+    // };
+    // if let Err(e) = run_sync(ctx, &sync_args) {
+    //     eprintln!("warning: provider sync failed: {}", e);
+    // }
+
     println!(
         "{}",
         serde_json::json!({
@@ -197,6 +270,7 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
             "archive": archive_path.display().to_string(),
             "index": index_path.display().to_string(),
             "config": config_path.display().to_string(),
+            "provider_skills_imported": provider_count,
         })
     );
 

@@ -7,6 +7,8 @@ use rusqlite::{Connection, Row, params};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+use crate::core::ids::DEFAULT_PROVIDER;
+use crate::core::{CanonicalId, SkillMetadata};
 use crate::error::{MsError, Result};
 use crate::security::{CommandSafetyEvent, QuarantineRecord};
 use crate::storage::migrations;
@@ -34,6 +36,7 @@ pub struct SkillRecord {
     pub author: Option<String>,
     pub source_path: String,
     pub source_layer: String,
+    pub provider: Option<String>,
     pub git_remote: Option<String>,
     pub git_commit: Option<String>,
     pub content_hash: String,
@@ -46,6 +49,39 @@ pub struct SkillRecord {
     pub modified_at: String,
     pub is_deprecated: bool,
     pub deprecation_reason: Option<String>,
+    /// Archive format version (set when skill is snapshotted into .ms/archive)
+    pub archive_format_version: Option<String>,
+    /// Provenance metadata as JSON: provider name, source path, import timestamp
+    pub provenance_json: String,
+}
+
+impl Default for SkillRecord {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            version: None,
+            author: None,
+            source_path: String::new(),
+            source_layer: String::new(),
+            provider: None,
+            git_remote: None,
+            git_commit: None,
+            content_hash: String::new(),
+            body: String::new(),
+            metadata_json: String::new(),
+            assets_json: String::new(),
+            token_count: 0,
+            quality_score: 0.0,
+            indexed_at: String::new(),
+            modified_at: String::new(),
+            is_deprecated: false,
+            deprecation_reason: None,
+            archive_format_version: None,
+            provenance_json: "{}".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,9 +222,10 @@ impl Database {
 
     pub fn get_skill(&self, id: &str) -> Result<Option<SkillRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, version, author, source_path, source_layer, \
+            "SELECT id, name, description, version, author, source_path, source_layer, provider, \
              git_remote, git_commit, content_hash, body, metadata_json, assets_json, \
-             token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason \
+             token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason, \
+             archive_format_version, provenance_json \
              FROM skills WHERE id = ?",
         )?;
         let mut rows = stmt.query([id])?;
@@ -198,11 +235,32 @@ impl Database {
         Ok(None)
     }
 
+    pub fn find_skills_by_metadata_ref(&self, skill_ref: &str) -> Result<Vec<SkillRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, version, author, source_path, source_layer, provider, \
+             git_remote, git_commit, content_hash, body, metadata_json, assets_json, \
+             token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason, \
+             archive_format_version, provenance_json \
+             FROM skills
+             WHERE json_extract(metadata_json, '$.canonical_id') = ?
+                OR json_extract(metadata_json, '$.display_id') = ?
+                OR json_extract(metadata_json, '$.id') = ?
+             ORDER BY modified_at DESC",
+        )?;
+        let rows = stmt.query_map(params![skill_ref, skill_ref, skill_ref], skill_from_row)?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     pub fn list_skills(&self, limit: usize, offset: usize) -> Result<Vec<SkillRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, version, author, source_path, source_layer, \
+            "SELECT id, name, description, version, author, source_path, source_layer, provider, \
              git_remote, git_commit, content_hash, body, metadata_json, assets_json, \
-             token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason \
+             token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason, \
+             archive_format_version, provenance_json \
              FROM skills ORDER BY modified_at DESC LIMIT ? OFFSET ?",
         )?;
         let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
@@ -357,11 +415,13 @@ impl Database {
     pub fn upsert_skill(&self, skill: &SkillRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO skills (
-                id, name, description, version, author, source_path, source_layer,
+                id, name, description, version, author, source_path, source_layer, provider,
                 git_remote, git_commit, content_hash, body, metadata_json, assets_json,
-                token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason
+                token_count, quality_score, indexed_at, modified_at, is_deprecated, deprecation_reason,
+                archive_format_version, provenance_json
              ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
              )
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
@@ -370,6 +430,7 @@ impl Database {
                 author=excluded.author,
                 source_path=excluded.source_path,
                 source_layer=excluded.source_layer,
+                provider=excluded.provider,
                 git_remote=excluded.git_remote,
                 git_commit=excluded.git_commit,
                 content_hash=excluded.content_hash,
@@ -381,7 +442,9 @@ impl Database {
                 indexed_at=excluded.indexed_at,
                 modified_at=excluded.modified_at,
                 is_deprecated=excluded.is_deprecated,
-                deprecation_reason=excluded.deprecation_reason",
+                deprecation_reason=excluded.deprecation_reason,
+                archive_format_version=excluded.archive_format_version,
+                provenance_json=excluded.provenance_json",
             params![
                 skill.id,
                 skill.name,
@@ -390,6 +453,7 @@ impl Database {
                 skill.author,
                 skill.source_path,
                 skill.source_layer,
+                skill.provider,
                 skill.git_remote,
                 skill.git_commit,
                 skill.content_hash,
@@ -402,6 +466,8 @@ impl Database {
                 skill.modified_at,
                 i32::from(skill.is_deprecated),
                 skill.deprecation_reason,
+                skill.archive_format_version,
+                skill.provenance_json,
             ],
         )?;
         Ok(())
@@ -949,10 +1015,11 @@ impl Database {
         layer: crate::core::SkillLayer,
         token_count: i64,
     ) -> Result<()> {
+        let skill_id = skill.storage_id();
         self.conn.execute(
             "INSERT INTO skills (id, name, description, version, author, source_path, source_layer, content_hash, body, metadata_json, assets_json, token_count, quality_score, indexed_at, modified_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, 'pending', '', ?, '{}', ?, 0.0, datetime('now'), datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, version=excluded.version, author=excluded.author, source_layer=excluded.source_layer, metadata_json=excluded.metadata_json, token_count=excluded.token_count, modified_at=excluded.modified_at",
             params![
-                skill.metadata.id,
+                skill_id,
                 skill.metadata.name,
                 skill.metadata.description,
                 skill.metadata.version,
@@ -1569,19 +1636,169 @@ fn skill_from_row(row: &Row<'_>) -> rusqlite::Result<SkillRecord> {
         author: row.get(4)?,
         source_path: row.get(5)?,
         source_layer: row.get(6)?,
-        git_remote: row.get(7)?,
-        git_commit: row.get(8)?,
-        content_hash: row.get(9)?,
-        body: row.get(10)?,
-        metadata_json: row.get(11)?,
-        assets_json: row.get(12)?,
-        token_count: row.get(13)?,
-        quality_score: row.get(14)?,
-        indexed_at: row.get(15)?,
-        modified_at: row.get(16)?,
-        is_deprecated: row.get::<_, i64>(17)? != 0,
-        deprecation_reason: row.get(18)?,
+        provider: row.get(7)?,
+        git_remote: row.get(8)?,
+        git_commit: row.get(9)?,
+        content_hash: row.get(10)?,
+        body: row.get(11)?,
+        metadata_json: row.get(12)?,
+        assets_json: row.get(13)?,
+        token_count: row.get(14)?,
+        quality_score: row.get(15)?,
+        indexed_at: row.get(16)?,
+        modified_at: row.get(17)?,
+        is_deprecated: row.get::<_, i64>(18)? != 0,
+        deprecation_reason: row.get(19)?,
+        archive_format_version: row.get(20)?,
+        provenance_json: row.get(21)?,
     })
+}
+
+pub fn merge_skill_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) -> SkillMetadata {
+    let db_meta: serde_json::Value = serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+
+    let provider = db_meta
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| skill.provider.clone())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if parsed_meta.provider.trim().is_empty() {
+                None
+            } else {
+                Some(parsed_meta.provider.clone())
+            }
+        })
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+
+    let short_id = db_meta
+        .get("id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if parsed_meta.id.trim().is_empty() {
+                None
+            } else {
+                Some(parsed_meta.id.clone())
+            }
+        })
+        .or_else(|| {
+            db_meta
+                .get("display_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty() && !value.contains('/'))
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            CanonicalId::parse(&skill.id).map(|canonical| {
+                if canonical.provider == DEFAULT_PROVIDER {
+                    skill.id.clone()
+                } else {
+                    canonical.skill_id
+                }
+            })
+        })
+        .unwrap_or_else(|| skill.id.clone());
+
+    let canonical_id = db_meta
+        .get("canonical_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if provider == DEFAULT_PROVIDER {
+                format!("{provider}/{short_id}")
+            } else if skill.id.contains('/') {
+                skill.id.clone()
+            } else {
+                format!("{provider}/{short_id}")
+            }
+        });
+
+    let display_id = db_meta
+        .get("display_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| short_id.clone());
+
+    SkillMetadata {
+        id: short_id,
+        provider,
+        canonical_id,
+        display_id,
+        name: skill.name.clone(),
+        version: skill.version.clone().unwrap_or_else(|| "0.1.0".to_string()),
+        description: skill.description.clone(),
+        tags: db_meta
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| parsed_meta.tags.clone()),
+        requires: db_meta
+            .get("requires")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| parsed_meta.requires.clone()),
+        provides: db_meta
+            .get("provides")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| parsed_meta.provides.clone()),
+        platforms: parsed_meta.platforms.clone(),
+        author: skill.author.clone().or_else(|| parsed_meta.author.clone()),
+        license: parsed_meta.license.clone(),
+        source_path: Some(skill.source_path.clone()),
+        context: parsed_meta.context.clone(),
+        trigger_phrases: db_meta
+            .get("trigger_phrases")
+            .and_then(|value| value.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| parsed_meta.trigger_phrases.clone()),
+        when_to_use: db_meta
+            .get("when_to_use")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| parsed_meta.when_to_use.clone()),
+        execution_mode: db_meta
+            .get("execution_mode")
+            .and_then(|value| value.as_str())
+            .and_then(crate::core::skill::ExecutionMode::from_str)
+            .unwrap_or(parsed_meta.execution_mode),
+        entry_sections: db_meta
+            .get("entry_sections")
+            .and_then(|value| value.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| parsed_meta.entry_sections.clone()),
+        keywords: db_meta
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| parsed_meta.keywords.clone()),
+    }
 }
 
 fn embedding_from_row(row: &Row<'_>) -> Result<EmbeddingRecord> {
@@ -1781,6 +1998,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
 
         db.upsert_skill(&record).unwrap();
@@ -1812,6 +2030,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
 
         db.upsert_skill(&record).unwrap();
@@ -1848,6 +2067,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         db.upsert_skill(&skill).unwrap();
 
@@ -1905,6 +2125,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
 
         db.upsert_skill(&record).unwrap();
@@ -1992,6 +2213,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         let newer = SkillRecord {
             id: "skill-newer".to_string(),
@@ -2013,6 +2235,7 @@ mod tests {
             modified_at: "2026-01-02T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
 
         db.upsert_skill(&older).unwrap();
@@ -2055,6 +2278,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         db.upsert_skill(&skill).unwrap();
 
@@ -2131,6 +2355,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         db.upsert_skill(&skill).unwrap();
 
@@ -2203,6 +2428,7 @@ mod tests {
             modified_at: "2026-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         db.upsert_skill(&skill).unwrap();
 
