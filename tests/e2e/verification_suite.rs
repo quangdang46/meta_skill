@@ -939,3 +939,62 @@ trigger_phrases: ["sync oversized route"]
 
     Ok(())
 }
+
+/// bd-17sp: compress resolves archived provider skills and preserves canonical rehydrate hints
+#[test]
+fn test_compress_uses_canonical_rehydrate_after_provider_deletion() -> Result<()> {
+    let mut fixture = E2EFixture::new("compress_provider_rehydrate");
+    let claude_root = fixture.root.join(".claude/skills");
+
+    create_provider_skill(
+        &claude_root.join("compress-provider"),
+        r#"---
+id: compress-provider
+name: Compress Provider
+description: Provider skill used to verify compress rehydrate hints
+tags: [compress, provider]
+trigger_phrases: ["compress provider route"]
+---
+# Compress Provider
+
+## Overview
+Use this skill to verify canonical rehydrate commands after provider deletion.
+
+## Checklist
+- Keep the command provider-qualified
+"#,
+        &[],
+        &[],
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    fixture.assert_success(&init_out, "init");
+
+    fs::remove_dir_all(&claude_root)?;
+
+    let compress_out = fixture.run_ms(&[
+        "--robot",
+        "compress",
+        "claude/compress-provider",
+        "--sections",
+    ]);
+    fixture.assert_success(&compress_out, "compress_after_provider_deletion");
+    let compress_json = compress_out.json();
+
+    assert_eq!(
+        compress_json["rehydrate_cmd"],
+        "ms load claude/compress-provider"
+    );
+    assert_eq!(compress_json["provider"], "claude");
+    assert!(
+        compress_json["section_rehydrate_cmds"]
+            .as_array()
+            .expect("section rehydrate cmds")
+            .iter()
+            .any(|entry| entry["rehydrate_cmd"]
+                == "ms load claude/compress-provider --section overview"),
+        "compress should keep provider-qualified section rehydrate commands"
+    );
+
+    Ok(())
+}

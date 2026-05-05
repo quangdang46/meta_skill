@@ -22,6 +22,7 @@ pub mod browse;
 pub mod build;
 pub mod bundle;
 pub mod cm;
+pub mod compress;
 pub mod config;
 pub mod conflicts;
 pub mod contract;
@@ -124,6 +125,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Doctor(args) => doctor::run(ctx, args),
         Commands::PreCommit(args) => pre_commit::run(ctx, args),
         Commands::Prune(args) => prune::run(ctx, args),
+        Commands::Compress(args) => compress::run(ctx, args),
         Commands::Config(args) => config::run(ctx, args),
         Commands::Security(args) => security::run(ctx, args),
         Commands::Setup(args) => setup::run(ctx, args),

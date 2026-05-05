@@ -260,6 +260,9 @@ pub enum Commands {
     /// Prune tombstoned/outdated data
     Prune(commands::prune::PruneArgs),
 
+    /// Compress a skill into a compact summary with rehydrate hints
+    Compress(commands::compress::CompressArgs),
+
     /// Manage configuration
     Config(commands::config::ConfigArgs),
 
