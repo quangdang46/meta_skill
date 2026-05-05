@@ -8,19 +8,13 @@
 //! - CASS unavailable error handling
 //! - JSON output format verification
 
-use std::process::Command;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use super::fixture::{E2EFixture, LogLevel};
-use ms::error::Result;
-
-/// Check if the `cass` binary is available on PATH.
-/// Tests that require CASS should call this and return early if unavailable.
-fn cass_available() -> bool {
-    Command::new("cass")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
+use ms::error::{MsError, Result};
+use serde_json::{Value, json};
 
 // ============================================================================
 // Skill definitions for gap analysis testing
@@ -64,12 +58,15 @@ Guidelines for writing effective and maintainable tests.
 // Helper: set up workspace with skills for gap analysis
 // ============================================================================
 
-fn setup_workspace(scenario: &str) -> Result<E2EFixture> {
+fn setup_workspace(scenario: &str) -> Result<(E2EFixture, PathBuf)> {
     let mut fixture = E2EFixture::new(scenario);
 
     fixture.log_step("Initialize ms");
     let output = fixture.init();
     fixture.assert_success(&output, "init");
+
+    fixture.log_step("Install fixture-backed cass shim");
+    let cass_bin = install_fake_cass(&fixture)?;
 
     fixture.log_step("Create skills for gap analysis");
     fixture.create_skill("debugging-patterns", SKILL_DEBUGGING)?;
@@ -85,10 +82,10 @@ fn setup_workspace(scenario: &str) -> Result<E2EFixture> {
         LogLevel::Info,
         "cross-project",
         "Workspace ready with 2 skills",
-        Some(serde_json::json!({ "skills": 2 })),
+        Some(json!({ "skills": 2, "cass_bin": cass_bin.display().to_string() })),
     );
 
-    Ok(fixture)
+    Ok((fixture, cass_bin))
 }
 
 /// Minimal workspace: init only, for validation tests.
@@ -100,6 +97,250 @@ fn setup_minimal(scenario: &str) -> Result<E2EFixture> {
     fixture.assert_success(&output, "init");
 
     Ok(fixture)
+}
+
+fn run_with_cass(fixture: &mut E2EFixture, cass_bin: &Path, args: &[&str]) -> super::fixture::CommandOutput {
+    let mut owned = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    owned.push("--cass-path".to_string());
+    owned.push(cass_bin.display().to_string());
+    let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+    fixture.run_ms(&refs)
+}
+
+fn install_fake_cass(fixture: &E2EFixture) -> Result<PathBuf> {
+    let cass_dir = fixture.root.join("fake_cass");
+    fs::create_dir_all(&cass_dir)
+        .map_err(|err| MsError::Config(format!("create fake cass dir: {err}")))?;
+
+    let session_root = cass_dir.join("sessions");
+    fs::create_dir_all(&session_root)
+        .map_err(|err| MsError::Config(format!("create fake cass session dir: {err}")))?;
+
+    write_json(
+        &cass_dir.join("search-all.json"),
+        &json!({
+            "hits": [
+                search_hit(&session_root, "session-001", "alpha-rust", "2026-01-14T10:00:00Z", "Debug a Rust panic in parser", 0.95),
+                search_hit(&session_root, "session-002", "beta-ui", "2026-01-15T08:30:00Z", "Refactor duplicate CLI output helpers", 0.81),
+                search_hit(&session_root, "session-003", "gamma-e2e", "2026-01-16T14:45:00Z", "Investigate a flaky E2E logging test", 0.88)
+            ],
+            "total_count": 3,
+            "truncated": false
+        }),
+    )?;
+    write_json(
+        &cass_dir.join("search-rust.json"),
+        &json!({
+            "hits": [
+                search_hit(&session_root, "session-001", "alpha-rust", "2026-01-14T10:00:00Z", "Debug a Rust panic in parser", 0.95)
+            ],
+            "total_count": 1,
+            "truncated": false
+        }),
+    )?;
+    write_json(
+        &cass_dir.join("search-empty.json"),
+        &json!({
+            "hits": [],
+            "total_count": 0,
+            "truncated": false
+        }),
+    )?;
+
+    write_json(
+        &cass_dir.join("show-session-001.json"),
+        &fake_session_json(
+            "session-001",
+            &session_root.join("session-001.jsonl"),
+            "alpha-rust",
+            "2026-01-14T10:00:00Z",
+            1200,
+            &["rust", "debugging"],
+            "Debug a Rust panic in parser",
+            "Reproduce the failure, inspect the parser, patch the guard, rerun tests.",
+            "cargo test parser",
+            "1 failed: parse_empty_input",
+        ),
+    )?;
+    write_json(
+        &cass_dir.join("show-session-002.json"),
+        &fake_session_json(
+            "session-002",
+            &session_root.join("session-002.jsonl"),
+            "beta-ui",
+            "2026-01-15T08:30:00Z",
+            980,
+            &["testing", "refactor"],
+            "Refactor duplicate CLI output helpers",
+            "Reproduce the failure, inspect the formatter, patch the helper, rerun tests.",
+            "cargo test formatters",
+            "formatter tests passed after helper extraction",
+        ),
+    )?;
+    write_json(
+        &cass_dir.join("show-session-003.json"),
+        &fake_session_json(
+            "session-003",
+            &session_root.join("session-003.jsonl"),
+            "gamma-e2e",
+            "2026-01-16T14:45:00Z",
+            1040,
+            &["testing", "e2e"],
+            "Investigate a flaky E2E logging test",
+            "Reproduce the failure, inspect the logs, patch the assertion, rerun tests.",
+            "cargo test e2e",
+            "intermittent failure: missing checkpoint event",
+        ),
+    )?;
+
+    let script_path = cass_dir.join("cass");
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")" && pwd)"
+command="${1:-}"
+
+case "$command" in
+  --version)
+    echo "cass 0.1.0"
+    ;;
+  search)
+    query="${2:-*}"
+    case "$query" in
+      rust)
+        cat "$root/search-rust.json"
+        ;;
+      "*")
+        cat "$root/search-all.json"
+        ;;
+      *)
+        cat "$root/search-empty.json"
+        ;;
+    esac
+    ;;
+  show)
+    session_id="${2:-}"
+    case "$session_id" in
+      session-001)
+        cat "$root/show-session-001.json"
+        ;;
+      session-002)
+        cat "$root/show-session-002.json"
+        ;;
+      session-003)
+        cat "$root/show-session-003.json"
+        ;;
+      *)
+        echo "session not found: $session_id" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    echo "unsupported command: $command" >&2
+    exit 1
+    ;;
+esac
+"#;
+    fs::write(&script_path, script)
+        .map_err(|err| MsError::Config(format!("write fake cass script: {err}")))?;
+    let mut perms = fs::metadata(&script_path)
+        .map_err(|err| MsError::Config(format!("stat fake cass script: {err}")))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms)
+        .map_err(|err| MsError::Config(format!("chmod fake cass script: {err}")))?;
+
+    Ok(script_path)
+}
+
+fn search_hit(
+    session_root: &Path,
+    session_id: &str,
+    project: &str,
+    timestamp: &str,
+    snippet: &str,
+    score: f32,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "path": session_root.join(format!("{session_id}.jsonl")).display().to_string(),
+        "score": score,
+        "snippet": snippet,
+        "content_hash": format!("hash-{session_id}"),
+        "project": project,
+        "timestamp": timestamp
+    })
+}
+
+fn fake_session_json(
+    session_id: &str,
+    path: &Path,
+    project: &str,
+    started_at: &str,
+    token_count: usize,
+    tags: &[&str],
+    user_prompt: &str,
+    assistant_plan: &str,
+    command: &str,
+    tool_result: &str,
+) -> Value {
+    json!({
+        "id": session_id,
+        "path": path.display().to_string(),
+        "content_hash": format!("hash-{session_id}"),
+        "metadata": {
+            "project": project,
+            "agent": "codex",
+            "model": "codex",
+            "started_at": started_at,
+            "ended_at": started_at,
+            "message_count": 3,
+            "token_count": token_count,
+            "tags": tags
+        },
+        "messages": [
+            {
+                "index": 0,
+                "role": "user",
+                "content": user_prompt,
+                "tool_calls": [],
+                "tool_results": []
+            },
+            {
+                "index": 1,
+                "role": "assistant",
+                "content": assistant_plan,
+                "tool_calls": [
+                    {
+                        "id": format!("{session_id}-tool"),
+                        "name": "Bash",
+                        "arguments": { "command": command }
+                    }
+                ],
+                "tool_results": [
+                    {
+                        "tool_call_id": format!("{session_id}-tool"),
+                        "content": tool_result,
+                        "is_error": false
+                    }
+                ]
+            },
+            {
+                "index": 2,
+                "role": "assistant",
+                "content": "Capture the fix, then rerun the focused tests and record the result.",
+                "tool_calls": [],
+                "tool_results": []
+            }
+        ]
+    })
+}
+
+fn write_json(path: &Path, value: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| MsError::Config(format!("serialize fake cass fixture: {err}")))?;
+    fs::write(path, bytes).map_err(|err| MsError::Config(format!("write {}: {err}", path.display())))
 }
 
 // ============================================================================
@@ -116,10 +357,7 @@ fn test_cross_project_summary_zero_limit() -> Result<()> {
     fixture.log_step("Run summary with limit=0");
     let output = fixture.run_ms(&["--robot", "cross-project", "summary", "--limit", "0"]);
 
-    assert!(
-        !output.success,
-        "Summary with limit=0 should fail"
-    );
+    assert!(!output.success, "Summary with limit=0 should fail");
 
     fixture.checkpoint("cross-project:post-summary-zero-limit");
 
@@ -144,10 +382,7 @@ fn test_cross_project_patterns_zero_limit() -> Result<()> {
     fixture.log_step("Run patterns with limit=0");
     let output = fixture.run_ms(&["--robot", "cross-project", "patterns", "--limit", "0"]);
 
-    assert!(
-        !output.success,
-        "Patterns with limit=0 should fail"
-    );
+    assert!(!output.success, "Patterns with limit=0 should fail");
 
     fixture.checkpoint("cross-project:post-patterns-zero-limit");
 
@@ -178,10 +413,7 @@ fn test_cross_project_patterns_zero_min_projects() -> Result<()> {
         "0",
     ]);
 
-    assert!(
-        !output.success,
-        "Patterns with min-projects=0 should fail"
-    );
+    assert!(!output.success, "Patterns with min-projects=0 should fail");
 
     fixture.checkpoint("cross-project:post-patterns-zero-min-projects");
 
@@ -206,10 +438,7 @@ fn test_cross_project_gaps_zero_limit() -> Result<()> {
     fixture.log_step("Run gaps with limit=0");
     let output = fixture.run_ms(&["--robot", "cross-project", "gaps", "--limit", "0"]);
 
-    assert!(
-        !output.success,
-        "Gaps with limit=0 should fail"
-    );
+    assert!(!output.success, "Gaps with limit=0 should fail");
 
     fixture.checkpoint("cross-project:post-gaps-zero-limit");
 
@@ -232,18 +461,9 @@ fn test_cross_project_gaps_zero_min_projects() -> Result<()> {
     fixture.checkpoint("cross-project:pre-gaps-zero-min-projects");
 
     fixture.log_step("Run gaps with min-projects=0");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "gaps",
-        "--min-projects",
-        "0",
-    ]);
+    let output = fixture.run_ms(&["--robot", "cross-project", "gaps", "--min-projects", "0"]);
 
-    assert!(
-        !output.success,
-        "Gaps with min-projects=0 should fail"
-    );
+    assert!(!output.success, "Gaps with min-projects=0 should fail");
 
     fixture.checkpoint("cross-project:post-gaps-zero-min-projects");
 
@@ -278,10 +498,7 @@ fn test_cross_project_summary_cass_unavailable() -> Result<()> {
         "/nonexistent/cass/binary",
     ]);
 
-    assert!(
-        !output.success,
-        "Summary with unavailable CASS should fail"
-    );
+    assert!(!output.success, "Summary with unavailable CASS should fail");
 
     fixture.checkpoint("cross-project:post-summary-no-cass");
 
@@ -346,10 +563,7 @@ fn test_cross_project_gaps_cass_unavailable() -> Result<()> {
         "/nonexistent/cass/binary",
     ]);
 
-    assert!(
-        !output.success,
-        "Gaps with unavailable CASS should fail"
-    );
+    assert!(!output.success, "Gaps with unavailable CASS should fail");
 
     fixture.checkpoint("cross-project:post-gaps-no-cass");
 
@@ -371,16 +585,12 @@ fn test_cross_project_gaps_cass_unavailable() -> Result<()> {
 /// Summary with default args should produce valid JSON output.
 #[test]
 fn test_cross_project_summary_json_output() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_summary_json")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_summary_json")?;
 
     fixture.checkpoint("cross-project:pre-summary");
 
     fixture.log_step("Run cross-project summary with robot mode");
-    let output = fixture.run_ms(&["--robot", "cross-project", "summary"]);
+    let output = run_with_cass(&mut fixture, &cass_bin, &["--robot", "cross-project", "summary"]);
     fixture.assert_success(&output, "cross-project summary");
 
     fixture.checkpoint("cross-project:post-summary");
@@ -404,6 +614,8 @@ fn test_cross_project_summary_json_output() -> Result<()> {
         json["projects"].is_array(),
         "Response should have projects array"
     );
+    assert_eq!(json["total_sessions"].as_u64(), Some(3));
+    assert_eq!(json["total_projects"].as_u64(), Some(3));
 
     let total = json["total_sessions"].as_u64().unwrap_or(0);
 
@@ -421,16 +633,16 @@ fn test_cross_project_summary_json_output() -> Result<()> {
 /// Summary with --top limit restricts output.
 #[test]
 fn test_cross_project_summary_top_limit() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_summary_top_limit")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_summary_top_limit")?;
 
     fixture.checkpoint("cross-project:pre-summary-top");
 
     fixture.log_step("Run summary with --top 2");
-    let output = fixture.run_ms(&["--robot", "cross-project", "summary", "--top", "2"]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "summary", "--top", "2"],
+    );
     fixture.assert_success(&output, "cross-project summary top");
 
     fixture.checkpoint("cross-project:post-summary-top");
@@ -438,8 +650,8 @@ fn test_cross_project_summary_top_limit() -> Result<()> {
     let json = output.json();
     let projects = json["projects"].as_array().expect("projects array");
     assert!(
-        projects.len() <= 2,
-        "Should return at most 2 projects, got {}",
+        projects.len() == 2,
+        "Should return exactly 2 projects, got {}",
         projects.len()
     );
 
@@ -457,16 +669,16 @@ fn test_cross_project_summary_top_limit() -> Result<()> {
 /// Summary with query filter narrows results.
 #[test]
 fn test_cross_project_summary_with_query() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_summary_query")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_summary_query")?;
 
     fixture.checkpoint("cross-project:pre-summary-query");
 
     fixture.log_step("Run summary with specific query");
-    let output = fixture.run_ms(&["--robot", "cross-project", "summary", "--query", "rust"]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "summary", "--query", "rust"],
+    );
     fixture.assert_success(&output, "cross-project summary with query");
 
     fixture.checkpoint("cross-project:post-summary-query");
@@ -477,6 +689,8 @@ fn test_cross_project_summary_with_query() -> Result<()> {
         Some("rust"),
         "Query should be preserved in output"
     );
+    assert_eq!(json["total_sessions"].as_u64(), Some(1));
+    assert_eq!(json["total_projects"].as_u64(), Some(1));
 
     fixture.emit_event(
         LogLevel::Info,
@@ -492,22 +706,22 @@ fn test_cross_project_summary_with_query() -> Result<()> {
 /// Summary with min-sessions filter.
 #[test]
 fn test_cross_project_summary_min_sessions() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_summary_min_sessions")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_summary_min_sessions")?;
 
     fixture.checkpoint("cross-project:pre-summary-min-sessions");
 
     fixture.log_step("Run summary with high min-sessions threshold");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "summary",
-        "--min-sessions",
-        "999999",
-    ]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &[
+            "--robot",
+            "cross-project",
+            "summary",
+            "--min-sessions",
+            "999999",
+        ],
+    );
     fixture.assert_success(&output, "cross-project summary min-sessions");
 
     fixture.checkpoint("cross-project:post-summary-min-sessions");
@@ -538,16 +752,16 @@ fn test_cross_project_summary_min_sessions() -> Result<()> {
 /// Patterns with default args should produce valid JSON output.
 #[test]
 fn test_cross_project_patterns_json_output() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_patterns_json")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_patterns_json")?;
 
     fixture.checkpoint("cross-project:pre-patterns");
 
     fixture.log_step("Run cross-project patterns with robot mode");
-    let output = fixture.run_ms(&["--robot", "cross-project", "patterns"]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "patterns"],
+    );
     fixture.assert_success(&output, "cross-project patterns");
 
     fixture.checkpoint("cross-project:post-patterns");
@@ -567,6 +781,11 @@ fn test_cross_project_patterns_json_output() -> Result<()> {
         json["patterns"].is_array(),
         "Response should have patterns array"
     );
+    assert_eq!(json["scanned_sessions"].as_u64(), Some(3));
+    assert!(
+        json["patterns"].as_array().is_some_and(|patterns| !patterns.is_empty()),
+        "Expected at least one cross-project pattern"
+    );
 
     fixture.emit_event(
         LogLevel::Info,
@@ -582,22 +801,22 @@ fn test_cross_project_patterns_json_output() -> Result<()> {
 /// Patterns with high thresholds should return fewer/no results.
 #[test]
 fn test_cross_project_patterns_high_thresholds() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_patterns_high_thresholds")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_patterns_high_thresholds")?;
 
     fixture.checkpoint("cross-project:pre-patterns-high-thresholds");
 
     fixture.log_step("Run patterns with very high occurrence threshold");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "patterns",
-        "--min-occurrences",
-        "999999",
-    ]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &[
+            "--robot",
+            "cross-project",
+            "patterns",
+            "--min-occurrences",
+            "999999",
+        ],
+    );
     fixture.assert_success(&output, "cross-project patterns high thresholds");
 
     fixture.checkpoint("cross-project:post-patterns-high-thresholds");
@@ -628,16 +847,12 @@ fn test_cross_project_patterns_high_thresholds() -> Result<()> {
 /// Gaps with default args should produce valid JSON output.
 #[test]
 fn test_cross_project_gaps_json_output() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_gaps_json")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_gaps_json")?;
 
     fixture.checkpoint("cross-project:pre-gaps");
 
     fixture.log_step("Run cross-project gaps with robot mode");
-    let output = fixture.run_ms(&["--robot", "cross-project", "gaps"]);
+    let output = run_with_cass(&mut fixture, &cass_bin, &["--robot", "cross-project", "gaps"]);
     fixture.assert_success(&output, "cross-project gaps");
 
     fixture.checkpoint("cross-project:post-gaps");
@@ -653,9 +868,11 @@ fn test_cross_project_gaps_json_output() -> Result<()> {
         json["scanned_sessions"].is_number(),
         "Response should have scanned_sessions"
     );
+    assert!(json["gaps"].is_array(), "Response should have gaps array");
+    assert_eq!(json["scanned_sessions"].as_u64(), Some(3));
     assert!(
-        json["gaps"].is_array(),
-        "Response should have gaps array"
+        json["gaps"].as_array().is_some_and(|gaps| !gaps.is_empty()),
+        "Expected at least one coverage gap from shared command/workflow patterns"
     );
 
     fixture.emit_event(
@@ -672,22 +889,16 @@ fn test_cross_project_gaps_json_output() -> Result<()> {
 /// Gaps with high min-score should consider most patterns as gaps.
 #[test]
 fn test_cross_project_gaps_min_score() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_gaps_min_score")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_gaps_min_score")?;
 
     fixture.checkpoint("cross-project:pre-gaps-min-score");
 
     fixture.log_step("Run gaps with high min-score to include more gaps");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "gaps",
-        "--min-score",
-        "100.0",
-    ]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "gaps", "--min-score", "100.0"],
+    );
     fixture.assert_success(&output, "cross-project gaps min-score");
 
     fixture.checkpoint("cross-project:post-gaps-min-score");
@@ -695,10 +906,7 @@ fn test_cross_project_gaps_min_score() -> Result<()> {
     let json = output.json();
     // With a very high min_score, all patterns should appear as gaps
     // (unless perfectly matched)
-    assert!(
-        json["gaps"].is_array(),
-        "Should return gaps array"
-    );
+    assert!(json["gaps"].is_array(), "Should return gaps array");
 
     fixture.emit_event(
         LogLevel::Info,
@@ -714,31 +922,30 @@ fn test_cross_project_gaps_min_score() -> Result<()> {
 /// Gaps with search-limit=1 should still work correctly.
 #[test]
 fn test_cross_project_gaps_search_limit() -> Result<()> {
-    if !cass_available() {
-        eprintln!("[SKIP] cass binary not available, skipping test");
-        return Ok(());
-    }
-    let mut fixture = setup_workspace("cross_project_gaps_search_limit")?;
+    let (mut fixture, cass_bin) = setup_workspace("cross_project_gaps_search_limit")?;
 
     fixture.checkpoint("cross-project:pre-gaps-search-limit");
 
     fixture.log_step("Run gaps with search-limit=1");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "gaps",
-        "--search-limit",
-        "1",
-    ]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "gaps", "--search-limit", "1"],
+    );
     fixture.assert_success(&output, "cross-project gaps search-limit");
 
     fixture.checkpoint("cross-project:post-gaps-search-limit");
 
     let json = output.json();
-    assert!(
-        json["gaps"].is_array(),
-        "Should return gaps array"
-    );
+    assert!(json["gaps"].is_array(), "Should return gaps array");
+    for gap in json["gaps"].as_array().expect("gaps array") {
+        if let Some(best_match) = gap.get("best_match") {
+            assert!(
+                best_match.is_null() || best_match.is_object(),
+                "best_match should be null or a single object"
+            );
+        }
+    }
 
     fixture.emit_event(
         LogLevel::Info,
@@ -759,18 +966,9 @@ fn test_cross_project_gaps_zero_search_limit() -> Result<()> {
     fixture.checkpoint("cross-project:pre-gaps-zero-search-limit");
 
     fixture.log_step("Run gaps with search-limit=0");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "cross-project",
-        "gaps",
-        "--search-limit",
-        "0",
-    ]);
+    let output = fixture.run_ms(&["--robot", "cross-project", "gaps", "--search-limit", "0"]);
 
-    assert!(
-        !output.success,
-        "Gaps with search-limit=0 should fail"
-    );
+    assert!(!output.success, "Gaps with search-limit=0 should fail");
 
     fixture.checkpoint("cross-project:post-gaps-zero-search-limit");
 
