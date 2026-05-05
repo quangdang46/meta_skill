@@ -252,30 +252,30 @@ pub struct IfStep {
 
 /// Conditions for skipping tests
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum SkipCondition {
     /// Skip on specific platform
-    Platform(String),
+    Platform { platform: String },
     /// Skip if command not found
-    CommandMissing(String),
+    CommandMissing { command_missing: String },
     /// Skip if file doesn't exist
-    FileMissing(String),
+    FileMissing { file_missing: String },
     /// Skip if environment variable not set
-    EnvMissing(String),
+    EnvMissing { env_missing: String },
 }
 
 /// System requirements
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum Requirement {
     /// Requires a command to be available
-    Command(String),
+    Command { command: String },
     /// Requires a file to exist
-    File(String),
+    File { file: String },
     /// Requires an environment variable
-    Env(String),
+    Env { env: String },
     /// Requires a specific platform
-    Platform(String),
+    Platform { platform: String },
 }
 
 impl TestSpec {
@@ -302,25 +302,25 @@ impl TestSpec {
         let conditions = self.skip_if.as_ref()?;
         for condition in conditions {
             match condition {
-                SkipCondition::Platform(p) => {
+                SkipCondition::Platform { platform } => {
                     let current = std::env::consts::OS;
-                    if current == p {
-                        return Some(format!("skip on platform: {p}"));
+                    if current == platform {
+                        return Some(format!("skip on platform: {platform}"));
                     }
                 }
-                SkipCondition::CommandMissing(cmd) => {
-                    if which::which(cmd).is_err() {
-                        return Some(format!("command not found: {cmd}"));
+                SkipCondition::CommandMissing { command_missing } => {
+                    if which::which(command_missing).is_err() {
+                        return Some(format!("command not found: {command_missing}"));
                     }
                 }
-                SkipCondition::FileMissing(f) => {
-                    if !std::path::Path::new(f).exists() {
-                        return Some(format!("file missing: {f}"));
+                SkipCondition::FileMissing { file_missing } => {
+                    if !std::path::Path::new(file_missing).exists() {
+                        return Some(format!("file missing: {file_missing}"));
                     }
                 }
-                SkipCondition::EnvMissing(var) => {
-                    if std::env::var(var).is_err() {
-                        return Some(format!("env var missing: {var}"));
+                SkipCondition::EnvMissing { env_missing } => {
+                    if std::env::var(env_missing).is_err() {
+                        return Some(format!("env var missing: {env_missing}"));
                     }
                 }
             }
@@ -336,28 +336,28 @@ impl TestSpec {
         };
         for req in requirements {
             match req {
-                Requirement::Command(cmd) => {
-                    if which::which(cmd).is_err() {
+                Requirement::Command { command } => {
+                    if which::which(command).is_err() {
                         return Err(MsError::ValidationFailed(format!(
-                            "required command not found: {cmd}"
+                            "required command not found: {command}"
                         )));
                     }
                 }
-                Requirement::File(path) => {
-                    if !std::path::Path::new(path).exists() {
+                Requirement::File { file } => {
+                    if !std::path::Path::new(file).exists() {
                         return Err(MsError::ValidationFailed(format!(
-                            "required file not found: {path}"
+                            "required file not found: {file}"
                         )));
                     }
                 }
-                Requirement::Env(var) => {
-                    if std::env::var(var).is_err() {
+                Requirement::Env { env } => {
+                    if std::env::var(env).is_err() {
                         return Err(MsError::ValidationFailed(format!(
-                            "required env var not set: {var}"
+                            "required env var not set: {env}"
                         )));
                     }
                 }
-                Requirement::Platform(platform) => {
+                Requirement::Platform { platform } => {
                     let current = std::env::consts::OS;
                     if current != platform {
                         return Err(MsError::ValidationFailed(format!(
@@ -433,13 +433,12 @@ steps:
       budget: 2000
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::LoadSkill { load_skill } => {
-                assert_eq!(load_skill.level, "comprehensive");
-                assert_eq!(load_skill.budget, Some(2000));
-            }
-            _ => panic!("expected LoadSkill step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::LoadSkill { .. }));
+        let TestStep::LoadSkill { load_skill } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(load_skill.level, "comprehensive");
+        assert_eq!(load_skill.budget, Some(2000));
     }
 
     #[test]
@@ -456,15 +455,14 @@ steps:
       timeout: 10s
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Run { run } => {
-                assert_eq!(run.cmd, "cargo build");
-                assert_eq!(run.cwd, Some("/tmp".to_string()));
-                assert_eq!(run.env.get("RUST_BACKTRACE"), Some(&"1".to_string()));
-                assert_eq!(run.timeout, Some(Duration::from_secs(10)));
-            }
-            _ => panic!("expected Run step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Run { .. }));
+        let TestStep::Run { run } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(run.cmd, "cargo build");
+        assert_eq!(run.cwd, Some("/tmp".to_string()));
+        assert_eq!(run.env.get("RUST_BACKTRACE"), Some(&"1".to_string()));
+        assert_eq!(run.timeout, Some(Duration::from_secs(10)));
     }
 
     #[test]
@@ -479,14 +477,13 @@ steps:
       file_exists: "/tmp/output.txt"
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Assert { assert } => {
-                assert_eq!(assert.exit_code, Some(0));
-                assert_eq!(assert.stdout_contains, Some("success".to_string()));
-                assert_eq!(assert.file_exists, Some("/tmp/output.txt".to_string()));
-            }
-            _ => panic!("expected Assert step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Assert { .. }));
+        let TestStep::Assert { assert } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(assert.exit_code, Some(0));
+        assert_eq!(assert.stdout_contains, Some("success".to_string()));
+        assert_eq!(assert.file_exists, Some("/tmp/output.txt".to_string()));
     }
 
     #[test]
@@ -515,13 +512,12 @@ steps:
       content: "hello world"
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::WriteFile { write_file } => {
-                assert_eq!(write_file.path, "/tmp/out.txt");
-                assert_eq!(write_file.content, "hello world");
-            }
-            _ => panic!("expected WriteFile step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::WriteFile { .. }));
+        let TestStep::WriteFile { write_file } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(write_file.path, "/tmp/out.txt");
+        assert_eq!(write_file.content, "hello world");
     }
 
     #[test]
@@ -534,13 +530,12 @@ steps:
       value: some_value
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Set { set } => {
-                assert_eq!(set.name, "MY_VAR");
-                assert_eq!(set.value, "some_value");
-            }
-            _ => panic!("expected Set step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Set { .. }));
+        let TestStep::Set { set } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(set.name, "MY_VAR");
+        assert_eq!(set.value, "some_value");
     }
 
     #[test]
@@ -553,13 +548,12 @@ steps:
       to: "/tmp/b.txt"
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Copy { copy } => {
-                assert_eq!(copy.from, "/tmp/a.txt");
-                assert_eq!(copy.to, "/tmp/b.txt");
-            }
-            _ => panic!("expected Copy step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Copy { .. }));
+        let TestStep::Copy { copy } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(copy.from, "/tmp/a.txt");
+        assert_eq!(copy.to, "/tmp/b.txt");
     }
 
     #[test]
@@ -571,12 +565,11 @@ steps:
       duration: 500ms
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Sleep { sleep } => {
-                assert_eq!(sleep.duration, Duration::from_millis(500));
-            }
-            _ => panic!("expected Sleep step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Sleep { .. }));
+        let TestStep::Sleep { sleep } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(sleep.duration, Duration::from_millis(500));
     }
 
     #[test]
@@ -589,13 +582,12 @@ steps:
       parents: true
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Mkdir { mkdir } => {
-                assert_eq!(mkdir.path, "/tmp/testdir");
-                assert!(mkdir.parents);
-            }
-            _ => panic!("expected Mkdir step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Mkdir { .. }));
+        let TestStep::Mkdir { mkdir } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(mkdir.path, "/tmp/testdir");
+        assert!(mkdir.parents);
     }
 
     #[test]
@@ -608,13 +600,12 @@ steps:
       recursive: true
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::Remove { remove } => {
-                assert_eq!(remove.path, "/tmp/testdir");
-                assert!(remove.recursive);
-            }
-            _ => panic!("expected Remove step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::Remove { .. }));
+        let TestStep::Remove { remove } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(remove.path, "/tmp/testdir");
+        assert!(remove.recursive);
     }
 
     #[test]
@@ -635,15 +626,14 @@ steps:
             value: other
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::If { if_step } => {
-                assert_eq!(if_step.condition.platform, Some("linux".to_string()));
-                assert_eq!(if_step.then_steps.len(), 1);
-                assert!(if_step.else_steps.is_some());
-                assert_eq!(if_step.else_steps.as_ref().unwrap().len(), 1);
-            }
-            _ => panic!("expected If step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::If { .. }));
+        let TestStep::If { if_step } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(if_step.condition.platform, Some("linux".to_string()));
+        assert_eq!(if_step.then_steps.len(), 1);
+        assert!(if_step.else_steps.is_some());
+        assert_eq!(if_step.else_steps.as_ref().unwrap().len(), 1);
     }
 
     #[test]
@@ -659,9 +649,18 @@ skip_if:
         let spec = TestSpec::from_yaml(yaml).unwrap();
         let skip_if = spec.skip_if.as_ref().unwrap();
         assert_eq!(skip_if.len(), 3);
-        matches!(&skip_if[0], SkipCondition::Platform(p) if p == "windows");
-        matches!(&skip_if[1], SkipCondition::CommandMissing(c) if c == "nonexistent-cmd");
-        matches!(&skip_if[2], SkipCondition::EnvMissing(v) if v == "NONEXISTENT_VAR");
+        assert!(matches!(
+            &skip_if[0],
+            SkipCondition::Platform { platform } if platform == "windows"
+        ));
+        assert!(matches!(
+            &skip_if[1],
+            SkipCondition::CommandMissing { command_missing } if command_missing == "nonexistent-cmd"
+        ));
+        assert!(matches!(
+            &skip_if[2],
+            SkipCondition::EnvMissing { env_missing } if env_missing == "NONEXISTENT_VAR"
+        ));
     }
 
     #[test]
@@ -677,9 +676,15 @@ requires:
         let spec = TestSpec::from_yaml(yaml).unwrap();
         let reqs = spec.requires.as_ref().unwrap();
         assert_eq!(reqs.len(), 3);
-        matches!(&reqs[0], Requirement::Command(c) if c == "git");
-        matches!(&reqs[1], Requirement::Env(e) if e == "HOME");
-        matches!(&reqs[2], Requirement::Platform(p) if p == "linux");
+        assert!(matches!(
+            &reqs[0],
+            Requirement::Command { command } if command == "git"
+        ));
+        assert!(matches!(&reqs[1], Requirement::Env { env } if env == "HOME"));
+        assert!(matches!(
+            &reqs[2],
+            Requirement::Platform { platform } if platform == "linux"
+        ));
     }
 
     #[test]
@@ -740,7 +745,10 @@ requires:
         let spec = TestSpec::from_yaml(yaml).unwrap();
         let result = spec.check_requirements();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("command not found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("command not found"));
     }
 
     #[test]
@@ -752,13 +760,12 @@ steps:
       budget: 500
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::LoadSkill { load_skill } => {
-                assert_eq!(load_skill.level, "standard");
-                assert_eq!(load_skill.budget, Some(500));
-            }
-            _ => panic!("expected LoadSkill step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::LoadSkill { .. }));
+        let TestStep::LoadSkill { load_skill } = &spec.steps[0] else {
+            return;
+        };
+        assert_eq!(load_skill.level, "standard");
+        assert_eq!(load_skill.budget, Some(500));
     }
 
     #[test]
@@ -799,12 +806,11 @@ steps:
             value: ci
 "#;
         let spec = TestSpec::from_yaml(yaml).unwrap();
-        match &spec.steps[0] {
-            TestStep::If { if_step } => {
-                let env_eq = if_step.condition.env_equals.as_ref().unwrap();
-                assert_eq!(env_eq.get("CI"), Some(&"true".to_string()));
-            }
-            _ => panic!("expected If step"),
-        }
+        assert!(matches!(&spec.steps[0], TestStep::If { .. }));
+        let TestStep::If { if_step } = &spec.steps[0] else {
+            return;
+        };
+        let env_eq = if_step.condition.env_equals.as_ref().unwrap();
+        assert_eq!(env_eq.get("CI"), Some(&"true".to_string()));
     }
 }

@@ -448,24 +448,24 @@ impl<'a> SkillTestRunner<'a> {
 
         for condition in conditions {
             match condition {
-                SkipCondition::Platform(platform) => {
+                SkipCondition::Platform { platform } => {
                     let current = std::env::consts::OS;
                     if platform == current {
                         return true;
                     }
                 }
-                SkipCondition::CommandMissing(cmd) => {
-                    if which::which(cmd).is_err() {
+                SkipCondition::CommandMissing { command_missing } => {
+                    if which::which(command_missing).is_err() {
                         return true;
                     }
                 }
-                SkipCondition::FileMissing(path) => {
-                    if !std::path::Path::new(path).exists() {
+                SkipCondition::FileMissing { file_missing } => {
+                    if !std::path::Path::new(file_missing).exists() {
                         return true;
                     }
                 }
-                SkipCondition::EnvMissing(var) => {
-                    if std::env::var(var).is_err() {
+                SkipCondition::EnvMissing { env_missing } => {
+                    if std::env::var(env_missing).is_err() {
                         return true;
                     }
                 }
@@ -484,22 +484,22 @@ impl<'a> SkillTestRunner<'a> {
 
         for req in requirements {
             match req {
-                Requirement::Command(cmd) => {
-                    if which::which(cmd).is_err() {
-                        return Some(format!("command '{cmd}'"));
+                Requirement::Command { command } => {
+                    if which::which(command).is_err() {
+                        return Some(format!("command '{command}'"));
                     }
                 }
-                Requirement::Env(var) => {
-                    if std::env::var(var).is_err() {
-                        return Some(format!("environment variable '{var}'"));
+                Requirement::Env { env } => {
+                    if std::env::var(env).is_err() {
+                        return Some(format!("environment variable '{env}'"));
                     }
                 }
-                Requirement::File(path) => {
-                    if !std::path::Path::new(path).exists() {
-                        return Some(format!("file '{path}'"));
+                Requirement::File { file } => {
+                    if !std::path::Path::new(file).exists() {
+                        return Some(format!("file '{file}'"));
                     }
                 }
-                Requirement::Platform(platform) => {
+                Requirement::Platform { platform } => {
                     let current = std::env::consts::OS;
                     if current != platform {
                         return Some(format!("platform '{platform}' (current: {current})"));
