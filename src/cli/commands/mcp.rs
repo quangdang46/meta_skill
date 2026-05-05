@@ -528,6 +528,39 @@ fn define_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "route".to_string(),
+            description: "Route a task description to the best matching skills".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Task description to route"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for context detection"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of candidates (default: 3)",
+                        "default": 3
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum score threshold 0.0-1.0 (default: 0.65)",
+                        "default": 0.65
+                    },
+                    "debug": {
+                        "type": "boolean",
+                        "description": "Include debug score breakdown",
+                        "default": false
+                    }
+                },
+                "required": ["task"]
+            }),
+        },
+        Tool {
             name: "suggest".to_string(),
             description: "Get context-aware skill suggestions based on working directory"
                 .to_string(),
@@ -873,6 +906,7 @@ fn handle_tools_call(
         "show" => handle_tool_show(ctx, &arguments),
         "doctor" => handle_tool_doctor(ctx, &arguments),
         "lint" => handle_tool_lint(ctx, &arguments),
+        "route" => handle_tool_route(ctx, &arguments),
         "suggest" => handle_tool_suggest(ctx, &arguments),
         "feedback" => handle_tool_feedback(ctx, &arguments),
         "index" => handle_tool_index(ctx, &arguments),
@@ -1281,6 +1315,37 @@ fn handle_tool_suggest(ctx: &AppContext, args: &Value) -> Result<ToolResult> {
         }).collect::<Vec<_>>()
     });
 
+    Ok(ToolResult::text(serde_json::to_string_pretty(&output)?))
+}
+
+fn handle_tool_route(ctx: &AppContext, args: &Value) -> Result<ToolResult> {
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MsError::ValidationFailed("Missing required parameter: task".to_string()))?;
+
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(3) as usize;
+
+    let threshold = args
+        .get("threshold")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.65);
+
+    let debug = args
+        .get("debug")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Get all skills and run routing via shared route_task function
+    let all_skills = crate::cli::commands::route::get_all_skills(ctx).unwrap_or_default();
+
+    let response =
+        crate::cli::commands::route::route_task(all_skills, task, limit, threshold, debug);
+
+    let output = serde_json::to_value(&response)?;
     Ok(ToolResult::text(serde_json::to_string_pretty(&output)?))
 }
 
@@ -1937,4 +2002,103 @@ mod tests {
             "Response should not contain ANSI codes"
         );
     }
+
+    // ===================== bd-2jfv: Route MCP schema tests =====================
+
+    #[test]
+    fn test_route_tool_is_registered() {
+        let tools = define_tools();
+        assert!(
+            tools.iter().any(|t| t.name == "route"),
+            "route tool must be registered in MCP tools"
+        );
+    }
+
+    #[test]
+    fn test_route_tool_input_schema_has_required_task() {
+        let tools = define_tools();
+        let route_tool = tools.iter().find(|t| t.name == "route").unwrap();
+        let schema = &route_tool.input_schema;
+        // "task" must be in required
+        let required = schema.get("required").and_then(|r| r.as_array());
+        assert!(required.is_some(), "input schema must have 'required' array");
+        let required_vec: Vec<&str> = required.unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required_vec.contains(&"task"),
+            "'task' must be required in route input schema"
+        );
+    }
+
+    #[test]
+    fn test_route_tool_input_schema_has_optional_params() {
+        let tools = define_tools();
+        let route_tool = tools.iter().find(|t| t.name == "route").unwrap();
+        let props = route_tool.input_schema.get("properties").unwrap();
+        // Optional params: cwd, limit, threshold, debug
+        assert!(props.get("cwd").is_some(), "cwd parameter must exist");
+        assert!(props.get("limit").is_some(), "limit parameter must exist");
+        assert!(props.get("threshold").is_some(), "threshold parameter must exist");
+        assert!(props.get("debug").is_some(), "debug parameter must exist");
+    }
+
+    #[test]
+    fn test_route_response_schema_serialization_roundtrip() {
+        use crate::cli::commands::route::{RouteCandidate, RouteFallback, RouteResponse};
+        let response = RouteResponse {
+            route_schema_version: 1u32,
+            task: "test task".to_string(),
+            threshold: 0.65,
+            decision: "match".to_string(),
+            candidates: vec![RouteCandidate {
+                skill_id: "claude/test-skill".to_string(),
+                display_id: "test-skill".to_string(),
+                score: 0.85,
+                why: vec!["keyword:test".to_string()],
+                when_to_use: Some("Testing scenarios".to_string()),
+                default_load: "standard".to_string(),
+                entry_sections: vec![],
+                load_command: "ms load claude/test-skill -O json".to_string(),
+                execution_mode: Some("inline".to_string()),
+            }],
+            debug_info: vec![],
+            fallback: None,
+        };
+        let json = serde_json::to_string_pretty(&response).unwrap();
+        // Verify all required fields are present
+        assert!(json.contains("route_schema_version"));
+        assert!(json.contains("decision"));
+        assert!(json.contains("candidates"));
+        assert!(json.contains("load_command"));
+        assert!(json.contains("search_command") == false, "no fallback for match");
+        // Roundtrip
+        let deserialized: RouteResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.route_schema_version, 1u32);
+        assert_eq!(deserialized.decision, "match");
+        assert_eq!(deserialized.candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_route_response_no_match_schema_includes_fallback() {
+        use crate::cli::commands::route::{RouteFallback, RouteResponse};
+        let response = RouteResponse {
+            route_schema_version: 1u32,
+            task: "impossible".to_string(),
+            threshold: 0.65,
+            decision: "no_match".to_string(),
+            candidates: vec![],
+            debug_info: vec![],
+            fallback: Some(RouteFallback {
+                search_command: "ms search \"impossible\" -O json".to_string(),
+                suggest_command: None,
+            }),
+        };
+        let json = serde_json::to_string_pretty(&response).unwrap();
+        assert!(json.contains("search_command"));
+        assert!(json.contains("suggest_command") == false, "suggest_command should be omitted when None");
+        // Verify fallback contract: search_command always present for no_match
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["fallback"]["search_command"].is_string());
+        assert!(parsed["fallback"]["suggest_command"].is_null());
+    }
+
 }
