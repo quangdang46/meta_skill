@@ -4,6 +4,7 @@
 //! - Query results (avoid re-searching)
 //! - Skill embeddings (avoid re-computing)
 //! - Session fingerprints (dedup suggestions)
+//! - Negative route results (avoid re-evaluating no-match decisions)
 //!
 //! Cache sizes are configurable and default to reasonable limits that
 //! balance memory usage with hit rates for typical workloads.
@@ -11,6 +12,7 @@
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 
@@ -24,6 +26,12 @@ const DEFAULT_EMBEDDING_CACHE_SIZE: usize = 1024;
 
 /// Default cache size for fingerprints (number of sessions)
 const DEFAULT_FINGERPRINT_CACHE_SIZE: usize = 256;
+
+/// Default cache size for negative route results
+const DEFAULT_NEGATIVE_ROUTE_CACHE_SIZE: usize = 512;
+
+/// Default TTL for negative route cache entries (300 seconds = 5 minutes)
+const DEFAULT_NEGATIVE_ROUTE_TTL_SECS: u64 = 300;
 
 /// Query result entry with metadata for cache management.
 #[derive(Debug, Clone)]
@@ -54,6 +62,40 @@ pub struct SessionFingerprint {
     pub keywords: Vec<String>,
 }
 
+/// Entry for negative route cache (route decision = no_match).
+///
+/// Caches the decision that a given task+cwd combination has no matching
+/// route, avoiding redundant route evaluation.
+#[derive(Debug, Clone)]
+pub struct NegativeRouteEntry {
+    /// The cache key hash
+    pub key_hash: u64,
+    /// When this entry was created (for TTL enforcement)
+    pub created_at: std::time::Instant,
+    /// Invalidation generation at creation time — entry is invalid if the
+    /// current generation differs.
+    pub generation: u64,
+}
+
+/// Cache key for negative route results.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct NegativeRouteKey {
+    /// Normalized task text
+    pub task_text: String,
+    /// CWD fingerprint (filesystem path or hash)
+    pub cwd_fingerprint: String,
+}
+
+impl NegativeRouteKey {
+    /// Compute a 64-bit hash for use as the LRU cache key.
+    pub fn hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.task_text.hash(&mut hasher);
+        self.cwd_fingerprint.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Thread-safe LRU caching layer for search operations.
 ///
 /// Caches are protected by mutexes for concurrent access.
@@ -65,8 +107,15 @@ pub struct CacheLayer {
     embedding_cache: Mutex<LruCache<String, CachedEmbedding>>,
     /// Session fingerprint cache (session ID -> fingerprint)
     fingerprint_cache: Mutex<LruCache<String, SessionFingerprint>>,
+    /// Negative route cache (route key hash -> entry)
+    negative_route_cache: Mutex<LruCache<u64, NegativeRouteEntry>>,
     /// Cache statistics
     stats: Mutex<CacheStats>,
+    /// Invalidation generation — bumped on provider sync or archive mutation.
+    /// Negative route entries cached under a different generation are stale.
+    invalidation_generation: AtomicU64,
+    /// TTL for negative route cache entries in seconds.
+    negative_route_ttl_secs: u64,
 }
 
 /// Cache statistics for monitoring and tuning.
@@ -84,6 +133,12 @@ pub struct CacheStats {
     pub fingerprint_hits: u64,
     /// Total fingerprint cache misses
     pub fingerprint_misses: u64,
+    /// Total negative route cache hits
+    pub negative_route_hits: u64,
+    /// Total negative route cache misses
+    pub negative_route_misses: u64,
+    /// Current invalidation generation
+    pub invalidation_generation: u64,
 }
 
 impl CacheStats {
@@ -119,6 +174,17 @@ impl CacheStats {
             self.fingerprint_hits as f64 / total as f64
         }
     }
+
+    /// Calculate negative route cache hit rate.
+    #[must_use]
+    pub fn negative_route_hit_rate(&self) -> f64 {
+        let total = self.negative_route_hits + self.negative_route_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.negative_route_hits as f64 / total as f64
+        }
+    }
 }
 
 impl Default for CacheLayer {
@@ -135,12 +201,18 @@ impl CacheLayer {
             DEFAULT_QUERY_CACHE_SIZE,
             DEFAULT_EMBEDDING_CACHE_SIZE,
             DEFAULT_FINGERPRINT_CACHE_SIZE,
+            DEFAULT_NEGATIVE_ROUTE_CACHE_SIZE,
         )
     }
 
     /// Create a new cache layer with custom sizes.
     #[must_use]
-    pub fn with_sizes(query_size: usize, embedding_size: usize, fingerprint_size: usize) -> Self {
+    pub fn with_sizes(
+        query_size: usize,
+        embedding_size: usize,
+        fingerprint_size: usize,
+        negative_route_size: usize,
+    ) -> Self {
         Self {
             query_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(query_size).unwrap_or(NonZeroUsize::new(1).unwrap()),
@@ -151,7 +223,12 @@ impl CacheLayer {
             fingerprint_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(fingerprint_size).unwrap_or(NonZeroUsize::new(1).unwrap()),
             )),
+            negative_route_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(negative_route_size).unwrap_or(NonZeroUsize::new(1).unwrap()),
+            )),
             stats: Mutex::new(CacheStats::default()),
+            invalidation_generation: AtomicU64::new(0),
+            negative_route_ttl_secs: DEFAULT_NEGATIVE_ROUTE_TTL_SECS,
         }
     }
 
@@ -255,9 +332,91 @@ impl CacheLayer {
         }
     }
 
+    // =========================================================================
+    // Negative route cache
+    // =========================================================================
+
+    /// Check if a route decision is cached as `no_match`.
+    ///
+    /// Returns `true` if the cache has a valid (non-expired, same generation)
+    /// entry for this key, meaning the route is known to be a no-match.
+    pub fn get_negative_route(&self, key: &NegativeRouteKey) -> bool {
+        let cache_key = key.hash();
+        let mut cache = match self.negative_route_cache.try_lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let mut stats = match self.stats.try_lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            // Check generation (invalidated by sync/archive mutation)
+            let current_gen = self.invalidation_generation.load(Ordering::Relaxed);
+            if entry.generation != current_gen {
+                stats.negative_route_misses += 1;
+                return false;
+            }
+
+            // Check TTL using full Duration precision so TTL=0 expires immediately
+            // instead of waiting for the next whole-second boundary.
+            if entry.created_at.elapsed()
+                >= std::time::Duration::from_secs(self.negative_route_ttl_secs)
+            {
+                stats.negative_route_misses += 1;
+                return false;
+            }
+
+            stats.negative_route_hits += 1;
+            true
+        } else {
+            stats.negative_route_misses += 1;
+            false
+        }
+    }
+
+    /// Cache a route decision as `no_match`.
+    pub fn put_negative_route(&self, key: &NegativeRouteKey) {
+        let cache_key = key.hash();
+        let generation = self.invalidation_generation.load(Ordering::Relaxed);
+
+        if let Ok(mut cache) = self.negative_route_cache.try_lock() {
+            cache.put(
+                cache_key,
+                NegativeRouteEntry {
+                    key_hash: cache_key,
+                    created_at: std::time::Instant::now(),
+                    generation,
+                },
+            );
+        }
+    }
+
+    /// Invalidate all negative route cache entries.
+    ///
+    /// Call this after any provider sync or archive mutation to ensure
+    /// stale route decisions are re-evaluated.
+    pub fn invalidate_negative_routes(&self) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Get the current invalidation generation.
+    pub fn invalidation_generation(&self) -> u64 {
+        self.invalidation_generation.load(Ordering::Relaxed)
+    }
+
+    /// Set a custom TTL for negative route entries (in seconds).
+    pub fn set_negative_route_ttl(&mut self, ttl_secs: u64) {
+        self.negative_route_ttl_secs = ttl_secs;
+    }
+
     /// Get current cache statistics.
     pub fn stats(&self) -> CacheStats {
-        self.stats.try_lock().map(|s| s.clone()).unwrap_or_default()
+        let r#gen = self.invalidation_generation.load(Ordering::Relaxed);
+        let mut s = self.stats.try_lock().map(|s| s.clone()).unwrap_or_default();
+        s.invalidation_generation = r#gen;
+        s
     }
 
     /// Clear all caches.
@@ -271,13 +430,16 @@ impl CacheLayer {
         if let Ok(mut cache) = self.fingerprint_cache.try_lock() {
             cache.clear();
         }
+        if let Ok(mut cache) = self.negative_route_cache.try_lock() {
+            cache.clear();
+        }
         if let Ok(mut stats) = self.stats.try_lock() {
             *stats = CacheStats::default();
         }
     }
 
     /// Get the current number of entries in each cache.
-    pub fn sizes(&self) -> (usize, usize, usize) {
+    pub fn sizes(&self) -> (usize, usize, usize, usize) {
         let query = self.query_cache.try_lock().map(|c| c.len()).unwrap_or(0);
         let embedding = self
             .embedding_cache
@@ -289,7 +451,12 @@ impl CacheLayer {
             .try_lock()
             .map(|c| c.len())
             .unwrap_or(0);
-        (query, embedding, fingerprint)
+        let negative_route = self
+            .negative_route_cache
+            .try_lock()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        (query, embedding, fingerprint, negative_route)
     }
 }
 
@@ -435,19 +602,25 @@ mod tests {
             },
         );
 
-        let (q, e, f) = cache.sizes();
-        assert_eq!((q, e, f), (1, 1, 1));
+        let key = NegativeRouteKey {
+            task_text: "test".to_string(),
+            cwd_fingerprint: "/test".to_string(),
+        };
+        cache.put_negative_route(&key);
+
+        let (q, e, f, n) = cache.sizes();
+        assert_eq!((q, e, f, n), (1, 1, 1, 1));
 
         cache.clear();
 
-        let (q, e, f) = cache.sizes();
-        assert_eq!((q, e, f), (0, 0, 0));
+        let (q, e, f, n) = cache.sizes();
+        assert_eq!((q, e, f, n), (0, 0, 0, 0));
     }
 
     #[test]
     fn test_cache_lru_eviction() {
         // Small cache to test eviction
-        let cache = CacheLayer::with_sizes(2, 2, 2);
+        let cache = CacheLayer::with_sizes(2, 2, 2, 2);
 
         // Fill cache
         cache.put_query("q1", 10, vec![]);
@@ -471,5 +644,122 @@ mod tests {
         let cache = CacheLayer::default();
         // Just verify it creates without panicking
         assert!(cache.get_query("test", 10).is_none());
+    }
+
+    // =========================================================================
+    // Negative route cache tests
+    // =========================================================================
+
+    #[test]
+    fn test_negative_route_basic() {
+        let cache = CacheLayer::new();
+
+        let key = NegativeRouteKey {
+            task_text: "build the project".to_string(),
+            cwd_fingerprint: "/home/user/project".to_string(),
+        };
+
+        // Miss on empty cache
+        assert!(!cache.get_negative_route(&key));
+
+        // Put and get
+        cache.put_negative_route(&key);
+        assert!(cache.get_negative_route(&key));
+    }
+
+    #[test]
+    fn test_negative_route_different_key() {
+        let cache = CacheLayer::new();
+
+        let key1 = NegativeRouteKey {
+            task_text: "build the project".to_string(),
+            cwd_fingerprint: "/home/user/project".to_string(),
+        };
+        let key2 = NegativeRouteKey {
+            task_text: "build the project".to_string(),
+            cwd_fingerprint: "/home/user/other".to_string(),
+        };
+
+        cache.put_negative_route(&key1);
+        assert!(cache.get_negative_route(&key1));
+        assert!(!cache.get_negative_route(&key2));
+    }
+
+    #[test]
+    fn test_negative_route_invalidation() {
+        let cache = CacheLayer::new();
+
+        let key = NegativeRouteKey {
+            task_text: "test task".to_string(),
+            cwd_fingerprint: "/test".to_string(),
+        };
+
+        cache.put_negative_route(&key);
+        assert!(cache.get_negative_route(&key));
+
+        // Invalidate all negative routes
+        cache.invalidate_negative_routes();
+        assert!(!cache.get_negative_route(&key));
+    }
+
+    #[test]
+    fn test_negative_route_ttl() {
+        let mut cache = CacheLayer::new();
+        cache.set_negative_route_ttl(0); // Immediate expiry
+
+        let key = NegativeRouteKey {
+            task_text: "test task".to_string(),
+            cwd_fingerprint: "/test".to_string(),
+        };
+
+        cache.put_negative_route(&key);
+        // Should miss because TTL is 0 (immediate expiry)
+        // Note: this might be flaky, but with TTL=0 the entry expires immediately
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!cache.get_negative_route(&key));
+    }
+
+    #[test]
+    fn test_negative_route_stats() {
+        let cache = CacheLayer::new();
+
+        let key = NegativeRouteKey {
+            task_text: "task".to_string(),
+            cwd_fingerprint: "/cwd".to_string(),
+        };
+
+        // Miss
+        cache.get_negative_route(&key);
+        let stats = cache.stats();
+        assert_eq!(stats.negative_route_misses, 1);
+        assert_eq!(stats.negative_route_hits, 0);
+
+        // Hit
+        cache.put_negative_route(&key);
+        cache.get_negative_route(&key);
+        let stats = cache.stats();
+        assert_eq!(stats.negative_route_hits, 1);
+        assert_eq!(stats.negative_route_misses, 1);
+    }
+
+    #[test]
+    fn test_negative_route_invalidation_generation() {
+        let cache = CacheLayer::new();
+        let gen0 = cache.invalidation_generation();
+
+        cache.invalidate_negative_routes();
+        let gen1 = cache.invalidation_generation();
+        assert_eq!(gen1, gen0 + 1);
+
+        // Entry cached at gen0 should be stale after bump
+        let key = NegativeRouteKey {
+            task_text: "task".to_string(),
+            cwd_fingerprint: "/cwd".to_string(),
+        };
+        cache.put_negative_route(&key);
+        assert!(cache.get_negative_route(&key));
+
+        cache.invalidate_negative_routes();
+        assert!(!cache.get_negative_route(&key));
     }
 }

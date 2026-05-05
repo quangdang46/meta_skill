@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::app::AppContext;
@@ -26,7 +26,8 @@ use crate::core::skill::{PackContract, SkillAssets, SkillMetadata};
 use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
 use crate::meta_skills::{ConditionContext, MetaSkillManager, MetaSkillRegistry};
-use crate::storage::sqlite::SkillRecord;
+use crate::search::content_cache::{CachedLoad, ContentCache, LoadCacheKey};
+use crate::storage::{SkillRecord, merge_skill_metadata};
 use crate::suggestions::bandit::{
     ContextualBandit, DefaultFeatureExtractor, FeatureExtractor, SkillFeedback, UserHistory,
 };
@@ -144,6 +145,10 @@ pub struct LoadArgs {
     #[arg(long)]
     pub contract_id: Option<String>,
 
+    /// Load only a specific section by slug (kebab-case section title)
+    #[arg(long)]
+    pub section: Option<String>,
+
     /// Max slices per coverage group
     #[arg(long, default_value = "2")]
     pub max_per_group: usize,
@@ -170,7 +175,7 @@ pub struct LoadArgs {
 }
 
 /// Result of loading a skill
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadResult {
     pub skill_id: String,
     pub name: String,
@@ -392,14 +397,14 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
 
     // Record auto-load events to the contextual bandit for learning
     if ctx.config.auto_load.learning_enabled {
-        let scores: Vec<(String, f32)> = candidates
+        let candidate_scores: Vec<(String, f32)> = candidates
             .iter()
             .map(|c| (c.skill_id.clone(), c.score))
             .collect();
         record_auto_load_events(
             &collected,
             &loaded_results,
-            &scores,
+            &candidate_scores,
             &ctx.config.auto_load,
             ctx.verbosity.into(),
         );
@@ -579,45 +584,7 @@ fn get_all_skill_metadata(ctx: &AppContext) -> Result<Vec<SkillMetadata>> {
 
 /// Convert `SkillRecord` to `SkillMetadata`
 fn skill_record_to_metadata(skill: &SkillRecord) -> SkillMetadata {
-    let meta_json: serde_json::Value =
-        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
-
-    SkillMetadata {
-        id: skill.id.clone(),
-        name: skill.name.clone(),
-        version: skill.version.clone().unwrap_or_else(|| "0.1.0".to_string()),
-        description: skill.description.clone(),
-        tags: meta_json
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        requires: meta_json
-            .get("requires")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        provides: meta_json
-            .get("provides")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        context: serde_json::from_value(meta_json.get("context").cloned().unwrap_or_default())
-            .unwrap_or_default(),
-        ..Default::default()
-    }
+    merge_skill_metadata(skill, &SkillMetadata::default())
 }
 
 fn context_summary_to_json(summary: &ContextSummary) -> serde_json::Value {
@@ -725,10 +692,7 @@ fn output_auto_human(ctx: &AppContext, result: &AutoLoadResult, _args: &LoadArgs
     println!("Detecting context...");
     if !result.context_summary.project_types.is_empty() {
         for (ptype, confidence) in &result.context_summary.project_types {
-            println!(
-                "  Project type: {} (confidence: {:.2})",
-                ptype, confidence
-            );
+            println!("  Project type: {} (confidence: {:.2})", ptype, confidence);
         }
     }
     println!(
@@ -758,10 +722,7 @@ fn output_auto_human(ctx: &AppContext, result: &AutoLoadResult, _args: &LoadArgs
             };
             println!(
                 "  {} [{:.2}] {} - {}",
-                status,
-                candidate.score,
-                candidate.skill_id,
-                candidate.skill_name
+                status, candidate.score, candidate.skill_id, candidate.skill_name
             );
         }
         println!();
@@ -858,6 +819,23 @@ pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> 
 
     // Determine disclosure plan
     let disclosure_plan = determine_disclosure_plan(args, contract);
+    let cache_key = build_load_cache_key(&skill_machine_id(&skill), &disclosure_plan, args.deps);
+    let content_cache = ContentCache::new(ctx.ms_root.join("cache").join("content"));
+
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = content_cache.get_load(key, &skill.content_hash) {
+            if let Ok(result) = serde_json::from_str::<LoadResult>(&cached.result_json) {
+                record_usage(
+                    ctx,
+                    &skill.id,
+                    &disclosure_plan,
+                    experiment_id.as_deref(),
+                    variant_id.as_deref(),
+                );
+                return Ok(result);
+            }
+        }
+    }
 
     // Parse skill body into SkillSpec
     let spec = parse_markdown(&skill.body)
@@ -888,7 +866,11 @@ pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> 
     };
 
     let result = LoadResult {
-        skill_id: skill.id.clone(),
+        skill_id: if spec.metadata.canonical_id.is_empty() {
+            skill.id.clone()
+        } else {
+            spec.metadata.canonical_id.clone()
+        },
         name: skill.name.clone(),
         disclosed,
         dependencies_loaded,
@@ -902,6 +884,13 @@ pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> 
             .collect(),
     };
 
+    if let Some(ref key) = cache_key {
+        let payload = CachedLoad {
+            result_json: serde_json::to_string(&result)?,
+        };
+        let _ = content_cache.put_load(key, &skill.content_hash, &payload);
+    }
+
     record_usage(
         ctx,
         &skill.id,
@@ -913,16 +902,75 @@ pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> 
     Ok(result)
 }
 
+fn build_load_cache_key(
+    skill_id: &str,
+    disclosure_plan: &DisclosurePlan,
+    deps_mode: DepsMode,
+) -> Option<LoadCacheKey> {
+    let cache_scope = match disclosure_plan {
+        DisclosurePlan::Level(level) => format!("{}|deps:{deps_mode:?}", level.name()),
+        DisclosurePlan::Pack(_) => return None,
+    };
+
+    Some(LoadCacheKey {
+        skill_id: skill_id.to_string(),
+        cache_scope,
+    })
+}
+
 fn resolve_skill(ctx: &AppContext, skill_ref: &str) -> Result<SkillRecord> {
-    // Try direct ID lookup
-    if let Some(skill) = ctx.db.get_skill(skill_ref)? {
-        return Ok(skill);
+    let direct = ctx.db.get_skill(skill_ref)?;
+
+    if skill_ref.contains('/') {
+        if let Some(skill) = direct {
+            return Ok(skill);
+        }
     }
 
-    // Try alias resolution
+    // Try alias resolution before fuzzy metadata matching.
     if let Some(alias_result) = ctx.db.resolve_alias(skill_ref)? {
         if let Some(skill) = ctx.db.get_skill(&alias_result.canonical_id)? {
             return Ok(skill);
+        }
+    }
+
+    let mut matches = ctx.db.find_skills_by_metadata_ref(skill_ref)?;
+    if let Some(skill) = &direct {
+        if !matches.iter().any(|candidate| candidate.id == skill.id) {
+            matches.push(skill.clone());
+        }
+    }
+
+    match matches.as_slice() {
+        [skill] => return Ok(skill.clone()),
+        [] => {}
+        matches => {
+            let ids = matches
+                .iter()
+                .map(skill_machine_id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(MsError::ValidationFailed(format!(
+                "skill reference '{}' is ambiguous; use one of: {}",
+                skill_ref, ids
+            )));
+        }
+    }
+
+    // Try direct ID lookup
+    if let Some(skill) = direct {
+        return Ok(skill);
+    }
+
+    // Archive fallback: check git archive for unindexed skills
+    if let Some(archive_path) = ctx.git.skill_path(skill_ref) {
+        if archive_path.exists() {
+            // Skill exists in archive but not in DB - this is expected for unindexed skills
+            // Return a placeholder that will be resolved when content is loaded
+            // For now, return a not-found error with archive hint
+            return Err(MsError::SkillNotFound(format!(
+                "skill not indexed: {skill_ref} (found in archive - run 'ms index' to add)"
+            )));
         }
     }
 
@@ -1111,6 +1159,12 @@ fn determine_disclosure_plan(args: &LoadArgs, contract: Option<PackContract>) ->
         });
     }
 
+    // Handle --section flag (load only one section by slug)
+    if let Some(ref slug) = args.section {
+        let sanitized = crate::core::disclosure::sanitize_slug(slug);
+        return DisclosurePlan::Level(DisclosureLevel::Section(sanitized));
+    }
+
     // Handle --complete flag
     if args.complete {
         return DisclosurePlan::Level(DisclosureLevel::Complete);
@@ -1243,46 +1297,31 @@ fn record_usage(
 }
 
 fn merge_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) -> SkillMetadata {
-    // Parse metadata_json from database
-    let db_meta: serde_json::Value = serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    merge_skill_metadata(skill, parsed_meta)
+}
 
-    SkillMetadata {
-        id: skill.id.clone(),
-        name: skill.name.clone(),
-        version: skill.version.clone().unwrap_or_else(|| "0.1.0".to_string()),
-        description: skill.description.clone(),
-        tags: db_meta
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(|| parsed_meta.tags.clone()),
-        requires: db_meta
-            .get("requires")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(|| parsed_meta.requires.clone()),
-        provides: db_meta
-            .get("provides")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(|| parsed_meta.provides.clone()),
-        platforms: parsed_meta.platforms.clone(),
-        author: skill.author.clone().or_else(|| parsed_meta.author.clone()),
-        license: parsed_meta.license.clone(),
-        context: parsed_meta.context.clone(),
-    }
+fn skill_machine_id(skill: &SkillRecord) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    metadata
+        .get("canonical_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if skill.id.contains('/') {
+                Some(skill.id.clone())
+            } else {
+                skill.provider.as_deref().map(|provider| {
+                    if provider == "local" {
+                        skill.id.clone()
+                    } else {
+                        format!("{provider}/{}", skill.id)
+                    }
+                })
+            }
+        })
+        .unwrap_or_else(|| skill.id.clone())
 }
 
 fn load_dependencies(
@@ -1794,7 +1833,13 @@ mod tests {
         let result = make_load_result("success-skill", 300);
         assert_eq!(result.name, "success-skill");
         assert!(result.disclosed.body.is_some());
-        assert!(result.disclosed.frontmatter.description.contains("success-skill"));
+        assert!(
+            result
+                .disclosed
+                .frontmatter
+                .description
+                .contains("success-skill")
+        );
     }
 
     // ── 6. test_load_render_conflict_diff ───────────────────────────
