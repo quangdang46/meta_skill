@@ -322,14 +322,18 @@ impl RelevanceScorer {
             return 0.0;
         }
 
-        let matches = context
-            .recent_files
+        let matched_patterns = skill_context
+            .file_patterns
             .iter()
-            .filter(|f| skill_context.matches_file(f))
+            .filter(|pattern| {
+                context
+                    .recent_files
+                    .iter()
+                    .any(|file| crate::core::skill::pattern_matches(pattern, file))
+            })
             .count();
 
-        // Normalize: more matches = higher score, capped at 1.0
-        (matches as f32 / context.recent_files.len() as f32).min(1.0)
+        matched_patterns as f32 / skill_context.file_patterns.len() as f32
     }
 
     /// Match skill's required tools against detected tools.
@@ -500,6 +504,35 @@ mod tests {
 
         let breakdown = scorer.breakdown(&skill, &context);
         assert!(breakdown.file_patterns < 0.001);
+    }
+
+    #[test]
+    fn test_file_pattern_match_uses_pattern_coverage() {
+        let scorer = RelevanceScorer::default();
+        let skill = SkillMetadata {
+            id: "markdown-docs".to_string(),
+            name: "Markdown Docs".to_string(),
+            context: ContextTags {
+                project_types: vec![],
+                file_patterns: vec![
+                    "*.md".to_string(),
+                    "README*".to_string(),
+                    "docs/**/*".to_string(),
+                ],
+                tools: vec![],
+                signals: vec![],
+            },
+            ..Default::default()
+        };
+        let context = WorkingContext::new().with_recent_files(vec![
+            "README.md".to_string(),
+            "docs/guide.md".to_string(),
+            "src/main.rs".to_string(),
+            ".ms/config.toml".to_string(),
+        ]);
+
+        let breakdown = scorer.breakdown(&skill, &context);
+        assert!(breakdown.file_patterns > 0.9);
     }
 
     #[test]

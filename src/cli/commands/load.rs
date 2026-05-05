@@ -1,7 +1,8 @@
 //! ms load - Load a skill with progressive disclosure
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
@@ -320,6 +321,16 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
     });
 
     if candidates.is_empty() {
+        if args.dry_run {
+            return output_dry_run(
+                ctx,
+                &context_summary,
+                &[],
+                args,
+                Some(format!("No skills match threshold {}", args.threshold)),
+            );
+        }
+
         match ctx.output_format {
             OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
                 let output = serde_json::json!({
@@ -353,7 +364,7 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
 
     // Dry-run mode: just show what would be loaded
     if args.dry_run {
-        return output_dry_run(ctx, &context_summary, &candidates, args);
+        return output_dry_run(ctx, &context_summary, &candidates, args, None);
     }
 
     // Load skills (with optional confirmation)
@@ -428,16 +439,53 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
 
 /// Convert `CollectedContext` to `WorkingContext` for scoring
 fn convert_to_scoring_context(collected: &CollectedContext) -> WorkingContext {
+    let recent_files = collected
+        .recent_files
+        .iter()
+        .map(|file| {
+            file.path
+                .strip_prefix(&collected.cwd)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
     WorkingContext::new()
         .with_projects(collected.detected_projects.clone())
-        .with_recent_files(
-            collected
-                .recent_files
-                .iter()
-                .map(|f| f.path.to_string_lossy().to_string())
-                .collect(),
-        )
+        .with_recent_files(recent_files)
         .with_tools(collected.detected_tools.iter().cloned())
+        .with_content(read_context_snippets(collected))
+}
+
+fn read_context_snippets(collected: &CollectedContext) -> Vec<String> {
+    const MAX_SNIPPETS: usize = 8;
+    const MAX_BYTES_PER_FILE: u64 = 8 * 1024;
+
+    collected
+        .recent_files
+        .iter()
+        .take(MAX_SNIPPETS)
+        .filter_map(|file| {
+            let handle = fs::File::open(&file.path).ok()?;
+            let mut buffer = Vec::new();
+            handle
+                .take(MAX_BYTES_PER_FILE)
+                .read_to_end(&mut buffer)
+                .ok()?;
+
+            if buffer.contains(&0) {
+                return None;
+            }
+
+            let snippet = String::from_utf8_lossy(&buffer).trim().to_string();
+            if snippet.is_empty() {
+                None
+            } else {
+                Some(snippet)
+            }
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -584,7 +632,8 @@ fn get_all_skill_metadata(ctx: &AppContext) -> Result<Vec<SkillMetadata>> {
 
 /// Convert `SkillRecord` to `SkillMetadata`
 fn skill_record_to_metadata(skill: &SkillRecord) -> SkillMetadata {
-    merge_skill_metadata(skill, &SkillMetadata::default())
+    let parsed_meta = serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    merge_skill_metadata(skill, &parsed_meta)
 }
 
 fn context_summary_to_json(summary: &ContextSummary) -> serde_json::Value {
@@ -603,6 +652,7 @@ fn output_dry_run(
     context_summary: &ContextSummary,
     candidates: &[RankedSkill],
     args: &LoadArgs,
+    message: Option<String>,
 ) -> Result<()> {
     match ctx.output_format {
         OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
@@ -624,7 +674,8 @@ fn output_dry_run(
                             }
                         })
                     }).collect::<Vec<_>>(),
-                    "threshold": args.threshold
+                    "threshold": args.threshold,
+                    "message": message
                 }
             });
             match ctx.output_format {
@@ -654,6 +705,11 @@ fn output_dry_run(
             }
         }
         OutputFormat::Human => {
+            if let Some(message) = &message {
+                println!("{message}");
+                println!();
+            }
+
             println!("Would load skills:");
             println!();
 
@@ -1704,6 +1760,10 @@ fn terminal_width() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::collector::{CollectedContext, CollectorFingerprint, RecentFile};
+    use chrono::Utc;
+    use std::collections::{HashMap, HashSet};
+    use tempfile::tempdir;
 
     #[test]
     fn test_load_result_struct() {
@@ -1756,6 +1816,70 @@ mod tests {
     fn test_cli_pack_mode_default() {
         let mode = CliPackMode::default();
         assert!(matches!(mode, CliPackMode::Balanced));
+    }
+
+    #[test]
+    fn test_convert_to_scoring_context_uses_relative_paths_and_content() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("error.rs");
+        std::fs::write(&file_path, "use thiserror::Error;\n").unwrap();
+
+        let collected = CollectedContext {
+            cwd: dir.path().to_path_buf(),
+            detected_projects: vec![],
+            recent_files: vec![RecentFile {
+                path: file_path,
+                extension: Some("rs".to_string()),
+                modified_at: Utc::now(),
+                size: 21,
+            }],
+            detected_tools: HashSet::new(),
+            git_context: None,
+            env_signals: HashMap::new(),
+            collected_at: Utc::now(),
+            fingerprint: CollectorFingerprint(0),
+        };
+
+        let context = convert_to_scoring_context(&collected);
+
+        assert_eq!(context.recent_files, vec!["src/error.rs".to_string()]);
+        assert!(context.matches_signal("use\\s+thiserror::Error"));
+    }
+
+    #[test]
+    fn test_skill_record_to_metadata_preserves_context_tags() {
+        let skill = SkillRecord {
+            id: "local/rust-errors".to_string(),
+            name: "Rust Error Handling".to_string(),
+            description: "Best practices".to_string(),
+            metadata_json: serde_json::json!({
+                "id": "rust-errors",
+                "provider": "local",
+                "canonical_id": "local/rust-errors",
+                "context": {
+                    "project_types": ["rust"],
+                    "file_patterns": ["*.rs", "Cargo.toml"],
+                    "tools": ["cargo", "rustc"]
+                }
+            })
+            .to_string(),
+            ..Default::default()
+        };
+
+        let metadata = skill_record_to_metadata(&skill);
+
+        assert_eq!(metadata.id, "rust-errors");
+        assert_eq!(metadata.context.project_types, vec!["rust".to_string()]);
+        assert_eq!(
+            metadata.context.file_patterns,
+            vec!["*.rs".to_string(), "Cargo.toml".to_string()]
+        );
+        assert_eq!(
+            metadata.context.tools,
+            vec!["cargo".to_string(), "rustc".to_string()]
+        );
     }
 
     // ==================== Rich Output Tests (bd-1p7k) ====================

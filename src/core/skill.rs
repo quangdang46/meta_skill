@@ -76,6 +76,17 @@ pub struct SkillSpec {
     /// Includes are applied after inheritance resolution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub includes: Vec<SkillInclude>,
+
+    // === ARCHIVE & PROVENANCE FIELDS ===
+    /// Archive format version for migration support.
+    /// Set when the skill is archived/snapshotted into `.ms/archive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_format_version: Option<String>,
+
+    /// Provenance tracking: original provider, source path, and import time.
+    /// Set during `ms init` or `ms providers sync`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SkillProvenance>,
 }
 
 // =============================================================================
@@ -151,6 +162,44 @@ pub enum IncludePosition {
     Append,
 }
 
+/// How a skill should be executed by an AI agent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Execute inline in the current context (default).
+    #[default]
+    Inline,
+    /// Execute in an isolated environment (subagent or sandbox).
+    Isolated,
+}
+
+impl ExecutionMode {
+    /// Parse from string.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "isolated" | "sandbox" => Some(Self::Isolated),
+            _ => None,
+        }
+    }
+
+    /// Get human-readable name.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl Default for SkillSpec {
     fn default() -> Self {
         Self {
@@ -163,6 +212,8 @@ impl Default for SkillSpec {
             replace_pitfalls: false,
             replace_checklist: false,
             includes: Vec::new(),
+            archive_format_version: None,
+            provenance: None,
         }
     }
 }
@@ -170,9 +221,18 @@ impl Default for SkillSpec {
 /// Skill metadata
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
-    /// Unique identifier
+    /// Unique identifier (short form, e.g., "rust-error-handling")
     #[serde(default)]
     pub id: String,
+    /// Provider namespace (e.g., "claude", "codex", "local")
+    #[serde(default)]
+    pub provider: String,
+    /// Canonical provider-qualified ID: `<provider>/<skill-id>`
+    #[serde(default)]
+    pub canonical_id: String,
+    /// Display ID: short form when unambiguous, canonical when ambiguous
+    #[serde(default)]
+    pub display_id: String,
     /// Human-readable name
     #[serde(default)]
     pub name: String,
@@ -200,9 +260,36 @@ pub struct SkillMetadata {
     /// License
     #[serde(default)]
     pub license: Option<String>,
+    /// Original source path (provenance)
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Context tags for auto-loading relevance matching.
     #[serde(default, skip_serializing_if = "ContextTags::is_empty")]
     pub context: ContextTags,
+
+    // === ROUTING METADATA ===
+    /// Compact routing keywords used by `ms route` for cheap matching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+
+    /// Trigger phrases for route matching (e.g., "rust compiler error", "sql injection").
+    /// Used by `ms route` to score candidates against a task description.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_phrases: Vec<String>,
+
+    /// Guidance on when this skill should be used vs. alternatives.
+    /// Shown in route candidates to help the caller choose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_to_use: Option<String>,
+
+    /// How this skill should be executed by an agent.
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+
+    /// Default entry sections for load on route match.
+    /// E.g., ["checklist", "pitfalls", "examples"].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_sections: Vec<String>,
 }
 
 /// A section in a skill
@@ -247,15 +334,24 @@ pub enum BlockType {
 }
 
 impl SkillSpec {
-    /// Current format version
+    /// Current format version (skill spec format)
     pub const FORMAT_VERSION: &'static str = "1.0";
+
+    /// Current archive format version (bundle format including assets/provenance).
+    /// New readers must support this version and at least one previous version.
+    pub const ARCHIVE_FORMAT_VERSION: &'static str = "1.0";
 
     /// Create a new empty spec
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        let id = id.into();
+        let canonical_id = format!("{}/{}", crate::core::ids::DEFAULT_PROVIDER, id);
         Self {
             format_version: Self::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
-                id: id.into(),
+                id: id.clone(),
+                provider: crate::core::ids::DEFAULT_PROVIDER.to_string(),
+                canonical_id: canonical_id.clone(),
+                display_id: id.clone(),
                 name: name.into(),
                 ..Default::default()
             },
@@ -266,6 +362,8 @@ impl SkillSpec {
             replace_pitfalls: false,
             replace_checklist: false,
             includes: Vec::new(),
+            archive_format_version: None,
+            provenance: None,
         }
     }
 
@@ -285,6 +383,60 @@ impl SkillSpec {
     #[must_use]
     pub fn parent_id(&self) -> Option<&str> {
         self.extends.as_deref()
+    }
+
+    /// Storage key used by the runtime registry and archive.
+    ///
+    /// Local skills remain keyed by their short id for compatibility.
+    /// Provider-imported skills use their provider-qualified canonical id.
+    #[must_use]
+    pub fn storage_id(&self) -> String {
+        self.metadata.storage_id()
+    }
+}
+
+impl SkillMetadata {
+    /// Provider namespace, defaulting to `local` when not set.
+    #[must_use]
+    pub fn provider_or_default(&self) -> &str {
+        if self.provider.trim().is_empty() {
+            crate::core::ids::DEFAULT_PROVIDER
+        } else {
+            self.provider.as_str()
+        }
+    }
+
+    /// Canonical provider-qualified id for this skill.
+    #[must_use]
+    pub fn canonical_id_or_default(&self) -> String {
+        if !self.canonical_id.trim().is_empty() {
+            self.canonical_id.clone()
+        } else {
+            format!("{}/{}", self.provider_or_default(), self.id)
+        }
+    }
+
+    /// Storage key used by the runtime registry and archive.
+    #[must_use]
+    pub fn storage_id(&self) -> String {
+        if self.provider_or_default() == crate::core::ids::DEFAULT_PROVIDER {
+            self.id.clone()
+        } else {
+            self.canonical_id_or_default()
+        }
+    }
+
+    /// Fill provider/canonical/display ids consistently for routing and storage.
+    pub fn normalize_ids(&mut self) {
+        if self.provider.trim().is_empty() {
+            self.provider = crate::core::ids::DEFAULT_PROVIDER.to_string();
+        }
+        if self.display_id.trim().is_empty() {
+            self.display_id = self.id.clone();
+        }
+        if self.canonical_id.trim().is_empty() {
+            self.canonical_id = self.canonical_id_or_default();
+        }
     }
 }
 
@@ -388,6 +540,26 @@ pub struct TestFile {
     /// Test framework (if applicable)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework: Option<String>,
+}
+
+// =============================================================================
+// SKILL PROVENANCE (IMPORT TRACKING)
+// =============================================================================
+
+/// Provenance metadata for an imported/snapshotted skill.
+///
+/// Records where the skill came from (provider name and source path)
+/// and when it was imported into the archive. This information is
+/// persisted in the archive so that skills remain traceable even after
+/// the original source directory is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillProvenance {
+    /// Provider name (e.g., "claude", "codex", "agents")
+    pub provider: String,
+    /// Original source path before archiving
+    pub source_path: std::path::PathBuf,
+    /// When the skill was imported into the archive
+    pub imported_at: chrono::DateTime<chrono::Utc>,
 }
 
 // =============================================================================
@@ -570,7 +742,7 @@ impl ContextSignal {
 }
 
 /// Simple glob pattern matching for file patterns.
-fn pattern_matches(pattern: &str, filename: &str) -> bool {
+pub(crate) fn pattern_matches(pattern: &str, filename: &str) -> bool {
     // Handle exact matches
     if pattern == filename {
         return true;

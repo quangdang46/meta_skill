@@ -320,11 +320,7 @@ fn run_restore(ctx: &AppContext, args: &BackupRestoreArgs) -> Result<()> {
             skipped.push(entry.name.clone());
             continue;
         }
-        if is_dir {
-            let _ = copy_dir_recursive(&source, &dest)?;
-        } else {
-            let _ = copy_file(&source, &dest)?;
-        }
+        let _ = restore_entry(&source, &dest, is_dir)?;
         restored += 1;
     }
 
@@ -508,6 +504,42 @@ fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
             .map_err(|err| MsError::Config(format!("create {}: {err}", parent.display())))?;
     }
     std::fs::copy(src, dst).map_err(|err| MsError::Config(format!("copy {}: {err}", src.display())))
+}
+
+fn restore_entry(src: &Path, dst: &Path, is_dir: bool) -> Result<u64> {
+    remove_existing_path(dst)?;
+    if is_dir {
+        copy_dir_recursive(src, dst)
+    } else {
+        copy_file(src, dst)
+    }
+}
+
+fn remove_existing_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(MsError::Config(format!("stat {}: {err}", path.display())));
+        }
+    };
+
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+            .map_err(|err| MsError::Config(format!("remove {}: {err}", path.display())))?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)
+            .map_err(|err| MsError::Config(format!("set permissions {}: {err}", path.display())))?;
+    }
+
+    std::fs::remove_file(path)
+        .map_err(|err| MsError::Config(format!("remove {}: {err}", path.display())))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
@@ -695,5 +727,44 @@ mod tests {
         assert_eq!(src, backup_dir.join("config.toml"));
         assert_eq!(dst, config_path);
         assert!(!is_dir);
+    }
+
+    #[test]
+    fn restore_entry_replaces_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+
+        std::fs::write(&src, "new content").unwrap();
+        std::fs::write(&dst, "old content").unwrap();
+
+        let mut permissions = std::fs::metadata(&dst).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&dst, permissions).unwrap();
+
+        restore_entry(&src, &dst, false).unwrap();
+
+        let restored = std::fs::read_to_string(&dst).unwrap();
+        assert_eq!(restored, "new content");
+    }
+
+    #[test]
+    fn restore_entry_replaces_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+
+        std::fs::create_dir_all(src.join(".git/objects/aa")).unwrap();
+        std::fs::create_dir_all(dst.join(".git/objects/aa")).unwrap();
+
+        std::fs::write(src.join(".git/objects/aa/object"), "fresh").unwrap();
+        std::fs::write(dst.join(".git/objects/aa/object"), "stale").unwrap();
+        std::fs::write(dst.join("extra.txt"), "should disappear").unwrap();
+
+        restore_entry(&src, &dst, true).unwrap();
+
+        let restored = std::fs::read_to_string(dst.join(".git/objects/aa/object")).unwrap();
+        assert_eq!(restored, "fresh");
+        assert!(!dst.join("extra.txt").exists());
     }
 }

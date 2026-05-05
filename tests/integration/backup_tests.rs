@@ -1,4 +1,4 @@
-use crate::fixture::TestFixture;
+use crate::fixture::{TestFixture, TestSkill};
 
 #[test]
 fn backup_create_and_restore_roundtrip() {
@@ -33,4 +33,84 @@ fn backup_restore_missing_id_errors() {
     let restore = fixture.run_ms(&["--robot", "backup", "restore", "missing", "--approve"]);
     assert!(!restore.success, "restore should fail for missing backup");
     assert!(restore.stdout.contains("\"error\""));
+}
+
+#[test]
+fn backup_restore_replaces_archive_state() {
+    let alpha = TestSkill::with_content(
+        "alpha-skill",
+        r#"---
+name: Alpha Skill
+description: First skill for backup testing
+tags: [test, alpha]
+---
+
+# Alpha Skill
+
+This is the original alpha skill.
+"#,
+    );
+    let beta = TestSkill::with_content(
+        "beta-skill",
+        r#"---
+name: Beta Skill
+description: Second skill for backup testing
+tags: [test, beta]
+---
+
+# Beta Skill
+
+This is the beta skill.
+"#,
+    );
+
+    let fixture = TestFixture::new("backup_restore_archive_state");
+    let init = fixture.init();
+    assert!(init.success, "init failed: {}", init.stderr);
+    fixture.add_skill(&alpha);
+    fixture.add_skill(&beta);
+
+    let index = fixture.run_ms(&["--robot", "index"]);
+    assert!(index.success, "index failed: {}", index.stderr);
+
+    let backup = fixture.run_ms(&["--robot", "backup", "create", "--id", "original"]);
+    assert!(backup.success, "backup create failed: {}", backup.stderr);
+
+    let modified = r#"---
+name: Alpha Skill Modified
+description: Modified version of alpha skill
+tags: [test, alpha, modified]
+---
+
+# Alpha Skill Modified
+
+This is the MODIFIED alpha skill.
+"#;
+    std::fs::write(
+        fixture.skills_dir.join("alpha-skill").join("SKILL.md"),
+        modified,
+    )
+    .expect("write modified skill");
+
+    let reindex = fixture.run_ms(&["--robot", "index"]);
+    assert!(reindex.success, "reindex failed: {}", reindex.stderr);
+
+    let search_before = fixture.run_ms(&["--robot", "search", "modified"]);
+    assert!(
+        search_before.success,
+        "search before restore failed: {}",
+        search_before.stderr
+    );
+    assert_eq!(search_before.json()["count"].as_u64(), Some(1));
+
+    let restore = fixture.run_ms(&["--robot", "backup", "restore", "original", "--approve"]);
+    assert!(restore.success, "backup restore failed: {}", restore.stderr);
+
+    let search_after = fixture.run_ms(&["--robot", "search", "modified"]);
+    assert!(
+        search_after.success,
+        "search after restore failed: {}",
+        search_after.stderr
+    );
+    assert_eq!(search_after.json()["count"].as_u64(), Some(0));
 }

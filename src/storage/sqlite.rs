@@ -1764,7 +1764,11 @@ pub fn merge_skill_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) ->
         author: skill.author.clone().or_else(|| parsed_meta.author.clone()),
         license: parsed_meta.license.clone(),
         source_path: Some(skill.source_path.clone()),
-        context: parsed_meta.context.clone(),
+        context: db_meta
+            .get("context")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_else(|| parsed_meta.context.clone()),
         trigger_phrases: db_meta
             .get("trigger_phrases")
             .and_then(|value| value.as_array())
@@ -1796,7 +1800,11 @@ pub fn merge_skill_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) ->
         keywords: db_meta
             .get("keywords")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| parsed_meta.keywords.clone()),
     }
 }
@@ -2039,6 +2047,41 @@ mod tests {
         assert_eq!(results[0].id, "rust-errors");
         assert_eq!(results[0].quality_score, 0.9);
         assert!(!results[0].is_deprecated);
+    }
+
+    #[test]
+    fn test_merge_skill_metadata_preserves_context_from_metadata_json() {
+        let skill = SkillRecord {
+            id: "local/rust-errors".to_string(),
+            name: "Rust Error Handling".to_string(),
+            description: "Best practices".to_string(),
+            metadata_json: serde_json::json!({
+                "id": "rust-errors",
+                "provider": "local",
+                "canonical_id": "local/rust-errors",
+                "display_id": "rust-errors",
+                "context": {
+                    "project_types": ["rust"],
+                    "file_patterns": ["*.rs", "Cargo.toml"],
+                    "tools": ["cargo", "rustc"]
+                }
+            })
+            .to_string(),
+            ..Default::default()
+        };
+
+        let metadata = merge_skill_metadata(&skill, &crate::core::skill::SkillMetadata::default());
+
+        assert_eq!(metadata.id, "rust-errors");
+        assert_eq!(metadata.context.project_types, vec!["rust".to_string()]);
+        assert_eq!(
+            metadata.context.file_patterns,
+            vec!["*.rs".to_string(), "Cargo.toml".to_string()]
+        );
+        assert_eq!(
+            metadata.context.tools,
+            vec!["cargo".to_string(), "rustc".to_string()]
+        );
     }
 
     #[test]
