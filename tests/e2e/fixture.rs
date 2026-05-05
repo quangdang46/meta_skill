@@ -1433,6 +1433,47 @@ impl E2EFixture {
         self.run_ms(&["--robot", "init"])
     }
 
+    /// Point project/global/local skill paths at the fixture-owned directories.
+    pub fn configure_default_skill_paths(&mut self) {
+        let raw = std::fs::read_to_string(&self.config_path)
+            .expect("Failed to read fixture config before path update");
+        let mut doc = toml::from_str::<toml::Value>(&raw)
+            .expect("Failed to parse fixture config before path update");
+
+        let root = doc
+            .as_table_mut()
+            .expect("Fixture config root should be a TOML table");
+        let skill_paths = root
+            .entry("skill_paths".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let skill_paths = skill_paths
+            .as_table_mut()
+            .expect("skill_paths should be a TOML table");
+
+        skill_paths.insert(
+            "project".to_string(),
+            toml::Value::Array(vec![toml::Value::String("./skills".to_string())]),
+        );
+        skill_paths.insert(
+            "global".to_string(),
+            toml::Value::Array(vec![toml::Value::String("./global_skills".to_string())]),
+        );
+        skill_paths.insert(
+            "local".to_string(),
+            toml::Value::Array(vec![toml::Value::String("./local_skills".to_string())]),
+        );
+
+        let rendered =
+            toml::to_string_pretty(&doc).expect("Failed to render fixture config after path update");
+        std::fs::write(&self.config_path, rendered)
+            .expect("Failed to persist fixture config path update");
+
+        println!(
+            "[E2E] Configured fixture skill paths in {:?}",
+            self.config_path
+        );
+    }
+
     /// Create a skill in the specified layer.
     pub fn create_skill(&self, name: &str, content: &str) -> Result<()> {
         self.create_skill_in_layer(name, content, "project")

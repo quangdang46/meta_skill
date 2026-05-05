@@ -331,6 +331,7 @@ fn setup_mcp_fixture(scenario: &str) -> Result<E2EFixture> {
     fixture.log_step("Initialize ms");
     let output = fixture.init();
     fixture.assert_success(&output, "init");
+    fixture.configure_default_skill_paths();
 
     fixture.log_step("Create test skills");
     fixture.create_skill_in_layer("rust-error-handling", SKILL_RUST_ERROR, "project")?;
@@ -664,8 +665,12 @@ fn test_mcp_list_show_tools() -> Result<()> {
     let show_text = response.tool_text().expect("Should have tool text");
     let show_result: Value = serde_json::from_str(show_text).expect("Should be valid JSON");
     assert!(
-        show_result["skill"].is_object(),
-        "Should have skill object in show result"
+        show_result["id"].as_str() == Some(first_skill_id),
+        "Show result should return the requested skill id"
+    );
+    assert!(
+        show_result["name"].is_string(),
+        "Show result should include a skill name"
     );
 
     client.kill();
