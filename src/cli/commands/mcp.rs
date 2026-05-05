@@ -2021,8 +2021,15 @@ mod tests {
         let schema = &route_tool.input_schema;
         // "task" must be in required
         let required = schema.get("required").and_then(|r| r.as_array());
-        assert!(required.is_some(), "input schema must have 'required' array");
-        let required_vec: Vec<&str> = required.unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required.is_some(),
+            "input schema must have 'required' array"
+        );
+        let required_vec: Vec<&str> = required
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(
             required_vec.contains(&"task"),
             "'task' must be required in route input schema"
@@ -2037,13 +2044,16 @@ mod tests {
         // Optional params: cwd, limit, threshold, debug
         assert!(props.get("cwd").is_some(), "cwd parameter must exist");
         assert!(props.get("limit").is_some(), "limit parameter must exist");
-        assert!(props.get("threshold").is_some(), "threshold parameter must exist");
+        assert!(
+            props.get("threshold").is_some(),
+            "threshold parameter must exist"
+        );
         assert!(props.get("debug").is_some(), "debug parameter must exist");
     }
 
     #[test]
     fn test_route_response_schema_serialization_roundtrip() {
-        use crate::cli::commands::route::{RouteCandidate, RouteFallback, RouteResponse};
+        use crate::cli::commands::route::{RouteCandidate, RouteResponse};
         let response = RouteResponse {
             route_schema_version: 1u32,
             task: "test task".to_string(),
@@ -2069,7 +2079,10 @@ mod tests {
         assert!(json.contains("decision"));
         assert!(json.contains("candidates"));
         assert!(json.contains("load_command"));
-        assert!(json.contains("search_command") == false, "no fallback for match");
+        assert!(
+            json.contains("search_command") == false,
+            "no fallback for match"
+        );
         // Roundtrip
         let deserialized: RouteResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.route_schema_version, 1u32);
@@ -2094,11 +2107,13 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&response).unwrap();
         assert!(json.contains("search_command"));
-        assert!(json.contains("suggest_command") == false, "suggest_command should be omitted when None");
+        assert!(
+            json.contains("suggest_command") == false,
+            "suggest_command should be omitted when None"
+        );
         // Verify fallback contract: search_command always present for no_match
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["fallback"]["search_command"].is_string());
         assert!(parsed["fallback"]["suggest_command"].is_null());
     }
-
 }

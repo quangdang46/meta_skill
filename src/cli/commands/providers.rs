@@ -335,8 +335,14 @@ fn sync_provider_root(
                         .is_some_and(|rel| changed_paths.contains(&rel))
                 })
                 .collect();
-            let import_result =
-                import_discovered_skills(discovered, collision_report, &ctx.git, &ctx.db, &ctx.search, &ctx.ms_root)?;
+            let import_result = import_discovered_skills(
+                discovered,
+                collision_report,
+                &ctx.git,
+                &ctx.db,
+                &ctx.search,
+                &ctx.ms_root,
+            )?;
             report.error_count += import_result.errors.len();
             report.collisions.extend(
                 import_result
@@ -768,7 +774,12 @@ fn compute_cache_size(cache_dir: &Path) -> usize {
     let mut count = 0;
     if let Ok(entries) = fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_file() && entry.path().extension().map_or(false, |e| e == "json") {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
+                count += 1;
+                continue;
+            }
+            if path.join("state.json").is_file() {
                 count += 1;
             }
         }
@@ -1042,5 +1053,20 @@ mod tests {
                 .iter()
                 .any(|(root, provider)| root == &missing_root && provider == "claude")
         );
+    }
+
+    #[test]
+    fn test_compute_cache_size_counts_provider_state_dirs() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = provider_cache_dir(temp.path());
+        let root_a = cache_dir.join("root_a");
+        let root_b = cache_dir.join("root_b");
+
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_a.join("state.json"), "{}").unwrap();
+        fs::write(root_b.join("state.json"), "{}").unwrap();
+
+        assert_eq!(compute_cache_size(&cache_dir), 2);
     }
 }
