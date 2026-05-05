@@ -57,28 +57,35 @@ Skills can come from anywhere: hand-written `SKILL.md` files, mined from CASS se
 ## Quick Example
 
 ```bash
-# Initialize a local ms root (.ms/)
+# Initialize: auto-discovers skills in .ms archive
 ms init
 
-# Configure skill paths
-ms config skill_paths.project '["./skills"]'
+# Route to the best skill for a task
+ms route "error handling"           # returns canonical provider/name ID
 
-# Index SKILL.md files
-ms index
+# Load full skill or a specific section
+ms load community/rust-errors       # full content
+ms load community/rust-errors --section patterns  # one section
+
+# Compress into a compact summary with rehydrate hints
+ms compress community/rust-errors
 
 # Search and inspect
 ms search "error handling"
 ms show rust-error-handling
 
-# Get context-aware suggestions
-ms suggest
+# Synchronize provider skill sources
+ms providers sync
+ms providers list
 
-# Analyze skill dependencies
-ms graph insights
+# Health check (detects degraded source state)
+ms providers doctor
 
 # Start MCP server for AI agent integration
 ms mcp serve
 ```
+
+Key behaviors: `ms init` auto-discovers skill sources. Every skill is archive-backed (Git + SQLite). Deleting a provider folder does not break `show`/`load`/`route` — the archive retains working copies. Skill suggestions adapt via bandit learning. Security layers (ACIP, DCG) protect against prompt injection and destructive commands.
 
 ---
 
@@ -268,40 +275,41 @@ Global flags work with all commands:
 ### Initialization and Configuration
 
 ```bash
-ms init                              # Create .ms/ in current directory
+ms init                              # Create .ms/ and auto-discover provider/local skills
 ms init --global                     # Create in ~/.local/share/ms/
 ms config                            # Show current config
-ms config skill_paths.project '["./skills"]'
-ms config search.use_embeddings true
+ms providers list                    # Inspect tracked provider roots and last sync state
+ms providers doctor                  # Verify runtime vs source-root health
 ```
 
 ### Indexing and Discovery
 
 ```bash
-ms index                             # Index all configured skill paths
-ms index ./skills /other/path        # Index specific paths
-ms list                              # List all indexed skills
+ms index                             # Re-index local/project skill changes
+ms index ./skills /other/path        # Index specific extra paths
+ms list                              # List all indexed/archive-backed skills
 ms list --tags rust --layer project  # Filter by tags/layer
 ms show rust-error-handling          # Full skill details
 ms show rust-error-handling --meta   # Metadata only
 ```
 
-### Search
+### Route-First Workflow
 
 ```bash
-ms search "error handling"           # Hybrid search (BM25 + semantic + RRF)
-ms search "async" --search-type bm25 # Lexical only
-ms search "async" --search-type semantic  # Semantic only
+ms route "error handling" -O json    # Primary agent entry point
+ms load claude/rust-errors --section patterns -O json
+ms search "error handling"           # Fallback when route returns no_match
 ```
 
-### Loading and Suggestions
+### Search and Suggestions
 
 ```bash
-ms load rust-error-handling --level overview  # Progressive disclosure
-ms load rust-error-handling --pack 2000       # Token-constrained packing
-ms load rust-error-handling --pack 800 --contract debug   # Contracted packing (debug/refactor/learn/quickref/codegen)
-ms suggest                           # Context-aware recommendations
-ms suggest --cwd /path/to/project    # Explicit context
+ms search "async" --search-type bm25      # Lexical only
+ms search "async" --search-type semantic  # Semantic only
+ms suggest                               # Secondary discovery path
+ms suggest --cwd /path/to/project        # Explicit context
+ms load rust-error-handling --level overview
+ms load rust-error-handling --pack 800 --contract debug
 ```
 
 ### Context-Aware Auto-Loading
@@ -693,44 +701,23 @@ Key environment variables:
 ````
 ## ms — Meta Skill CLI
 
-Local-first skill management platform with dual persistence (SQLite + Git), hybrid search (BM25 + hash embeddings via RRF), multi-layer security (ACIP injection defense + DCG command safety), adaptive suggestions (Thompson sampling bandit), and native AI agent integration (MCP server).
+Use `ms` as a route-first skill runtime. `ms init` auto-discovers provider skill folders, snapshots them into `.ms/archive`, and keeps `show`/`load`/`route` working even if the source provider folders are later removed.
 
-### Core Workflow
-
-```bash
-ms init                              # Initialize
-ms config skill_paths.project '["./skills"]'
-ms index                             # Index skills
-ms search "query"                    # Hybrid search
-ms suggest                           # Context-aware recommendations
-ms load skill-name --pack 2000       # Token-constrained loading
-```
-
-### For AI Agents
+### Agent Loop
 
 ```bash
-ms mcp serve                         # Start MCP server
-ms search "query" --robot            # JSON output
-ms load skill --level overview --robot
+ms route "<task>" -O json
+ms load <canonical-id> --section <slug> -O json
+ms search "<task>" -O json           # only when route returns no_match
+ms providers sync                    # when provider skills change
+ms providers doctor                  # diagnose degraded source roots
 ```
 
-### Key Commands
+### Notes
 
-| Command | Purpose |
-|---------|---------|
-| `ms search` | Hybrid search (BM25 + semantic) |
-| `ms suggest` | Context-aware suggestions with bandit optimization |
-| `ms load` | Progressive disclosure with token packing |
-| `ms graph` | Dependency analysis via bv |
-| `ms security` | ACIP prompt injection defense |
-| `ms safety` | DCG command safety gates |
-| `ms evidence` | Provenance tracking |
-| `ms antipatterns` | Failure pattern detection |
-| `ms template` | Curated authoring templates |
-| `ms bundle` | Portable skill packages |
-| `ms backup` | Snapshot and restore ms state |
-| `ms sync` | Multi-machine synchronization |
-| `ms mcp` | MCP server for AI agents |
+- Canonical IDs use `provider/skill-id`.
+- `ms route` is the primary entry point; `ms search` is fallback/discovery.
+- Deleted provider folders do not break runtime reads, but `ms providers doctor` will report degraded source state until the roots come back.
 ````
 
 ---
@@ -752,10 +739,13 @@ ms load skill --level overview --robot
 
 ## Troubleshooting
 
-### "No skill paths configured"
+### "No skills found after init"
 
 ```bash
-ms config skill_paths.project '["./skills"]'
+ms init
+ms providers list
+ms index ./skills                    # if you added project-local skills after init
+ms providers sync                    # if provider folders changed after init
 ```
 
 ### "bv is not available"
@@ -770,8 +760,19 @@ cargo install --git https://github.com/Dicklesworthstone/beads_viewer
 ### "Search returns no results"
 
 ```bash
-ms index          # Re-index skills
-ms doctor --fix   # Check for issues
+ms route "your task" -O json         # primary path; inspect decision + fallback
+ms search "your task"                # broader fallback discovery
+ms providers doctor                  # source roots may be degraded but runtime still usable
+ms providers sync                    # re-import provider changes if roots changed
+```
+
+### "Provider root missing or degraded"
+
+```bash
+ms providers doctor
+ms show <canonical-id>               # archive-backed runtime still works
+ms load <canonical-id> --section <slug>
+ms providers sync                    # once the source root is restored
 ```
 
 ### "ACIP not enabled"
