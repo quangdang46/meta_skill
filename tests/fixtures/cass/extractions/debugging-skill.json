@@ -1,0 +1,12 @@
+{
+  "skill_name": "rust-debugging",
+  "description": "Debug Rust failures by reproducing first, making a narrow fix, and rerunning focused tests.",
+  "patterns": [
+    "Reproduce the failure before editing code",
+    "Patch the smallest boundary or ownership issue first",
+    "Rerun focused tests after each fix"
+  ],
+  "confidence": 0.85,
+  "source_sessions": ["session-001", "session-003"],
+  "tags": ["rust", "debugging", "testing"]
+}

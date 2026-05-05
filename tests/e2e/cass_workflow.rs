@@ -11,54 +11,24 @@
 //! or use mock data to exercise internal processing logic.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::fixture::E2EFixture;
 use ms::error::Result;
 
-/// Create a mock CASS session file in JSONL format.
-fn create_mock_session_file(path: &PathBuf, session_id: &str) {
-    let session_content = format!(
-        r#"{{"session_id":"{id}","created":"2026-01-14T10:00:00Z","model":"claude-3-opus","token_count":5000}}
-{{"role":"user","content":"I need help debugging a Rust memory issue","timestamp":"2026-01-14T10:00:01Z"}}
-{{"role":"assistant","content":"I'll help you debug the memory issue. Let me first look at your code to understand the context.","timestamp":"2026-01-14T10:00:05Z"}}
-{{"role":"tool_use","tool":"Read","parameters":{{"file":"src/main.rs"}},"timestamp":"2026-01-14T10:00:06Z"}}
-{{"role":"tool_result","content":"fn main() {{\n    let data: Vec<u8> = Vec::new();\n    // potential memory leak here\n}}","timestamp":"2026-01-14T10:00:07Z"}}
-{{"role":"assistant","content":"I found the issue. The Vec is created but ownership isn't properly handled. Here's the fix:","timestamp":"2026-01-14T10:00:10Z"}}
-{{"role":"tool_use","tool":"Edit","parameters":{{"file":"src/main.rs","old":"let data","new":"let mut data"}},"timestamp":"2026-01-14T10:00:11Z"}}
-{{"role":"tool_result","content":"Edit successful","timestamp":"2026-01-14T10:00:12Z"}}
-{{"role":"assistant","content":"I've fixed the memory issue. Now let's verify with tests.","timestamp":"2026-01-14T10:00:15Z"}}
-{{"role":"tool_use","tool":"Bash","parameters":{{"command":"cargo test"}},"timestamp":"2026-01-14T10:00:16Z"}}
-{{"role":"tool_result","content":"running 5 tests\ntest result: ok. 5 passed","timestamp":"2026-01-14T10:00:20Z"}}
-{{"role":"assistant","content":"All tests pass. The memory issue has been resolved.","timestamp":"2026-01-14T10:00:25Z"}}
-"#,
-        id = session_id
-    );
-    fs::write(path, session_content).expect("Failed to write mock session");
+fn cass_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cass")
 }
 
-/// Create a mock extraction result for CASS.
-fn create_mock_extraction(path: &PathBuf, skill_name: &str) {
-    let extraction = format!(
-        r#"{{
-  "skill_name": "{}",
-  "description": "Debugging memory issues in Rust applications",
-  "patterns": [
-    "Read source files to understand context before making changes",
-    "Use mutable bindings when ownership needs to transfer",
-    "Run tests after each significant change to verify correctness"
-  ],
-  "anti_patterns": [
-    "Making changes without understanding the codebase first",
-    "Ignoring test verification after fixes"
-  ],
-  "confidence": 0.85,
-  "source_sessions": ["session-001"],
-  "tags": ["rust", "debugging", "memory-safety"]
-}}"#,
-        skill_name
-    );
-    fs::write(path, extraction).expect("Failed to write mock extraction");
+fn copy_cass_fixture(relative_path: &str, destination: &Path) -> Result<()> {
+    let source = cass_fixture_root().join(relative_path);
+    fs::copy(&source, destination)
+        .map(|_| ())
+        .map_err(|err| ms::error::MsError::Config(format!(
+            "copy CASS fixture {} -> {} failed: {err}",
+            source.display(),
+            destination.display()
+        )))
 }
 
 /// Test the full CASS integration workflow.
@@ -72,8 +42,8 @@ fn test_cass_integration_workflow() -> Result<()> {
     fixture.assert_success(&output, "init");
     fixture.checkpoint("post_init");
 
-    // Step 2: Setup mock CASS data
-    fixture.log_step("Setup mock CASS data directory");
+    // Step 2: Setup fixture-backed CASS data
+    fixture.log_step("Setup CASS data directory from repo fixtures");
 
     let cass_dir = fixture.root.join("cass_data");
     fs::create_dir_all(&cass_dir).expect("Failed to create CASS data dir");
@@ -81,25 +51,34 @@ fn test_cass_integration_workflow() -> Result<()> {
     let sessions_dir = cass_dir.join("sessions");
     fs::create_dir_all(&sessions_dir).expect("Failed to create sessions dir");
 
-    // Create mock session files
-    create_mock_session_file(&sessions_dir.join("session-001.jsonl"), "session-001");
-    create_mock_session_file(&sessions_dir.join("session-002.jsonl"), "session-002");
-    create_mock_session_file(&sessions_dir.join("session-003.jsonl"), "session-003");
+    for session_name in [
+        "session-001.jsonl",
+        "session-002.jsonl",
+        "session-003.jsonl",
+    ] {
+        copy_cass_fixture(
+            &format!("sessions/{session_name}"),
+            &sessions_dir.join(session_name),
+        )?;
+    }
 
-    println!("[CASS] Created 3 mock sessions in {:?}", sessions_dir);
+    println!("[CASS] Copied 3 session fixtures into {:?}", sessions_dir);
     fixture.checkpoint("post_session_setup");
 
-    // Step 3: Setup mock extraction result
-    fixture.log_step("Setup mock extraction result");
+    // Step 3: Setup fixture-backed extraction result
+    fixture.log_step("Setup extraction fixture");
 
     let extractions_dir = cass_dir.join("extractions");
     fs::create_dir_all(&extractions_dir).expect("Failed to create extractions dir");
-    create_mock_extraction(
+    copy_cass_fixture(
+        "extractions/debugging-skill.json",
         &extractions_dir.join("debugging-skill.json"),
-        "rust-debugging",
-    );
+    )?;
 
-    println!("[CASS] Created mock extraction in {:?}", extractions_dir);
+    println!(
+        "[CASS] Copied extraction fixture into {:?}",
+        extractions_dir
+    );
     fixture.checkpoint("post_extraction_setup");
 
     // Step 4: Test build command (CASS integration entry point)

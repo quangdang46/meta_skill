@@ -2247,3 +2247,170 @@ fn generate_error_suggestions(error: &str, error_type: &str) -> Vec<String> {
 
     suggestions
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE_TEST_SKILL: &str = r#"---
+name: Fixture Test Skill
+description: Used to verify fixture diagnostics
+tags: [test, fixture]
+---
+
+# Fixture Test Skill
+
+## Overview
+This skill exists only to exercise fixture logging and checkpointing.
+"#;
+
+    #[test]
+    fn test_fixture_structured_logging_and_environment_capture() -> Result<()> {
+        let mut fixture = E2EFixture::new("fixture_structured_logging");
+
+        let initial_event = fixture
+            .log_events()
+            .first()
+            .expect("fixture should capture an initial environment event");
+        assert_eq!(initial_event.category, "environment");
+        assert_eq!(initial_event.scenario, "fixture_structured_logging");
+        assert!(initial_event.data.is_some());
+
+        fixture.emit_event(
+            LogLevel::Info,
+            "custom",
+            "custom event for log verification",
+            Some(serde_json::json!({ "key": "value" })),
+        );
+        fixture.log_environment();
+
+        let categories: Vec<&str> = fixture
+            .log_events()
+            .iter()
+            .map(|event| event.category.as_str())
+            .collect();
+        assert!(
+            categories.contains(&"custom"),
+            "expected custom event in log categories: {categories:?}"
+        );
+
+        let log_path = fixture.root.join("e2e_log.jsonl");
+        let log_contents = std::fs::read_to_string(&log_path)?;
+        assert!(
+            log_contents.contains("\"category\":\"environment\""),
+            "expected environment event in {}",
+            log_path.display()
+        );
+        assert!(
+            log_contents.contains("\"category\":\"custom\""),
+            "expected custom event in {}",
+            log_path.display()
+        );
+
+        let export_path = fixture.root.join("exported_logs.json");
+        fixture.export_logs(&export_path)?;
+        let exported = std::fs::read_to_string(&export_path)?;
+        assert!(
+            exported.contains("fixture_structured_logging"),
+            "expected exported logs to include scenario name"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fixture_checkpoint_diagnostics_and_html_report() -> Result<()> {
+        let mut fixture = E2EFixture::with_config(
+            "fixture_checkpoint_diagnostics",
+            E2EConfig {
+                html_report: true,
+                ..E2EConfig::default()
+            },
+        );
+
+        fixture.log_step("Initialize workspace");
+        let init = fixture.init();
+        fixture.assert_success(&init, "init");
+        fixture.open_db();
+        fixture.checkpoint("before_index");
+
+        fixture.log_step("Create indexed skill");
+        fixture.create_skill("fixture-test-skill", FIXTURE_TEST_SKILL)?;
+
+        fixture.log_step("Index fixture skill");
+        let index = fixture.run_ms(&["--robot", "index"]);
+        fixture.assert_success(&index, "index");
+        fixture.db = None;
+        fixture.open_db();
+        fixture.checkpoint("after_index");
+
+        let diff = fixture
+            .checkpoint_diff("before_index", "after_index")
+            .expect("checkpoint diff should exist");
+        assert!(
+            diff.has_changes(),
+            "expected checkpoint diff to report changes"
+        );
+
+        let fs_diff = diff.fs_diff.as_ref().expect("expected fs diff");
+        assert!(
+            !fs_diff.added_files.is_empty() || !fs_diff.modified_files.is_empty(),
+            "expected filesystem changes after creating and indexing a skill"
+        );
+
+        let db_diff = diff.db_diff.as_ref().expect("expected db diff");
+        assert!(
+            !db_diff.row_count_changes.is_empty()
+                || !db_diff.added_tables.is_empty()
+                || db_diff.size_delta != 0,
+            "expected database snapshot changes after indexing"
+        );
+
+        let timing = fixture.timing_report();
+        assert!(
+            timing.by_category.contains_key("command"),
+            "expected command timings"
+        );
+        assert!(
+            timing.by_category.contains_key("checkpoint"),
+            "expected checkpoint timings"
+        );
+
+        let diagnostics = fixture.failure_diagnostics("database not found", "command");
+        assert_eq!(diagnostics.error_type, "command");
+        assert!(
+            diagnostics.db_state.is_some(),
+            "expected db snapshot in diagnostics"
+        );
+        assert!(
+            diagnostics.fs_state.is_some(),
+            "expected fs snapshot in diagnostics"
+        );
+        assert!(
+            diagnostics
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("database")),
+            "expected database-oriented remediation suggestions"
+        );
+
+        fixture.generate_report();
+
+        let html_path = fixture.root.join("report.html");
+        let html = std::fs::read_to_string(&html_path)?;
+        assert!(
+            html.contains("fixture_checkpoint_diagnostics"),
+            "expected scenario name in HTML report"
+        );
+        assert!(
+            html.contains("Timing Breakdown"),
+            "expected timing section in HTML report"
+        );
+        assert!(
+            html.contains("Checkpoints"),
+            "expected checkpoint section in HTML report"
+        );
+
+        Ok(())
+    }
+}

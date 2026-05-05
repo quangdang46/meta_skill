@@ -57,16 +57,22 @@ fn test_doctor_robot_emits_pure_json() {
         .args(["doctor", "--robot"])
         .assert()
         .success();
-    let stdout = String::from_utf8(assert.get_output().stdout.clone())
-        .expect("stdout must be utf-8");
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be utf-8");
 
     // The whole stdout must parse as a single JSON value — not a JSON
     // value preceded by progress text. That's what makes the CI test
     // robust against the bug class this fix addresses.
-    let parsed: Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|err| panic!("doctor --robot stdout is not pure JSON: {err}\n--- stdout ---\n{stdout}\n--- end stdout ---"));
+    let parsed = serde_json::from_str(stdout.trim()).ok();
+    assert!(
+        parsed.is_some(),
+        "doctor --robot stdout is not pure JSON\n--- stdout ---\n{stdout}\n--- end stdout ---"
+    );
+    let parsed: Value = parsed.unwrap_or(Value::Null);
 
-    let obj = parsed.as_object().expect("top-level JSON must be an object");
+    let obj = parsed
+        .as_object()
+        .expect("top-level JSON must be an object");
     let status = obj
         .get("status")
         .and_then(|v| v.as_str())
@@ -296,6 +302,7 @@ Some content.
         author: None,
         source_path: "skills/test-skill.md".to_string(),
         source_layer: "project".to_string(),
+        provider: None,
         git_remote: None,
         git_commit: None,
         content_hash: "hash".to_string(),
@@ -308,6 +315,8 @@ Some content.
         modified_at: now,
         is_deprecated: false,
         deprecation_reason: None,
+        archive_format_version: None,
+        provenance_json: "{}".to_string(),
     };
     db.upsert_skill(&record).unwrap();
     drop(db);

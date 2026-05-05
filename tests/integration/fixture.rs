@@ -5,6 +5,15 @@ use std::time::Duration;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+fn cass_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cass")
+}
+
+fn copy_cass_fixture(relative_path: &str, destination: &Path) -> std::io::Result<()> {
+    let source = cass_fixture_root().join(relative_path);
+    std::fs::copy(&source, destination).map(|_| ())
+}
+
 // =============================================================================
 // Assertion Macros
 // =============================================================================
@@ -193,18 +202,29 @@ impl TestFixture {
         let fixture = Self::new(test_name);
 
         let cass_dir = fixture.root.join("mock_cass");
-        std::fs::create_dir_all(&cass_dir).expect("Failed to create mock CASS dir");
+        let sessions_dir = cass_dir.join("sessions");
+        let extractions_dir = cass_dir.join("extractions");
+        std::fs::create_dir_all(&sessions_dir).expect("Failed to create CASS sessions dir");
+        std::fs::create_dir_all(&extractions_dir).expect("Failed to create CASS extractions dir");
 
-        let extraction = r#"{
-  "skill_name": "test-skill",
-  "description": "A test skill for integration testing",
-  "patterns": ["pattern1", "pattern2"],
-  "confidence": 0.85
-}"#;
-        std::fs::write(cass_dir.join("extraction.json"), extraction)
-            .expect("Failed to write mock extraction");
+        for session_name in [
+            "session-001.jsonl",
+            "session-002.jsonl",
+            "session-003.jsonl",
+        ] {
+            copy_cass_fixture(
+                &format!("sessions/{session_name}"),
+                &sessions_dir.join(session_name),
+            )
+            .expect("Failed to copy CASS session fixture");
+        }
+        copy_cass_fixture(
+            "extractions/debugging-skill.json",
+            &extractions_dir.join("debugging-skill.json"),
+        )
+        .expect("Failed to copy CASS extraction fixture");
 
-        println!("[FIXTURE] Mock CASS configured at: {cass_dir:?}");
+        println!("[FIXTURE] Fixture-backed CASS configured at: {cass_dir:?}");
 
         fixture
     }
