@@ -233,6 +233,20 @@ fn run_sync(ctx: &AppContext, args: &SyncArgs) -> Result<()> {
                     println!("    ~ {}", s);
                 }
             }
+
+            if !report.lint_warnings.is_empty() {
+                println!();
+                println!("  {} Import lint:", "!".yellow());
+                for warning in &report.lint_warnings {
+                    println!("    - {} ({})", warning.path.display(), warning.skill_id);
+                    for diagnostic in &warning.diagnostics {
+                        println!("      [{}] {}", diagnostic.severity, diagnostic.message);
+                        if let Some(suggestion) = diagnostic.suggestion.as_deref() {
+                            println!("        hint: {suggestion}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -255,6 +269,7 @@ fn sync_provider_root(
         collisions: Vec::new(),
         new_skills: Vec::new(),
         changed_skills: Vec::new(),
+        lint_warnings: Vec::new(),
     };
 
     // Ensure cache dir exists
@@ -350,6 +365,7 @@ fn sync_provider_root(
                     .into_iter()
                     .map(|err| format!("{}: {}", err.path.display(), err.message)),
             );
+            report.lint_warnings.extend(import_result.warnings);
 
             ctx.cache.invalidate_negative_routes();
             let content_cache = ContentCache::new(content_cache_dir(&ctx.ms_root));
@@ -440,6 +456,7 @@ struct ProviderSyncReport {
     collisions: Vec<String>,
     new_skills: Vec<String>,
     changed_skills: Vec<String>,
+    lint_warnings: Vec<crate::import::provider::ImportWarning>,
 }
 
 // ===========================================================================

@@ -30,7 +30,7 @@ use crate::lint::rule::BoxedRule;
 // Re-export individual rules for direct use
 pub use quality::{
     ActionableRulesRule, BalancedContentRule, EmbeddingQualityRule, ExamplesHaveCodeRule,
-    MeaningfulDescriptionRule, TokenBudgetRule,
+    MeaningfulDescriptionRule, OversizedSkillMdRule, TokenBudgetRule,
 };
 pub use reference::{DeepInheritanceRule, FormatVersionRule, NoCycleRule, ValidExtendsRule};
 pub use security::{InputSanitizationRule, NoPromptInjectionRule, NoSecretsRule, SafePathsRule};
@@ -90,8 +90,8 @@ mod tests {
     fn test_all_rules_not_empty() {
         let rules = all_rules();
         assert!(!rules.is_empty());
-        // Should have: 5 structural + 4 reference + 4 security + 4 quality + 2 performance = 19
-        assert!(rules.len() >= 19);
+        // Should have: 5 structural + 4 reference + 4 security + 5 quality + 2 performance = 20
+        assert!(rules.len() >= 20);
     }
 
     #[test]
@@ -115,11 +115,7 @@ mod tests {
     #[test]
     fn test_quality_rules_count() {
         let rules = quality_rules();
-        assert_eq!(rules.len(), 4);
-    }
-
-    #[test]
-    fn test_performance_rules_count() {
+        assert_eq!(rules.len(), 5);
         let rules = performance_rules();
         assert_eq!(rules.len(), 2);
     }

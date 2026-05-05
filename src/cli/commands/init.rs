@@ -175,14 +175,19 @@ fn init_human(target: &Path, args: &InitArgs) -> Result<()> {
     if existing_roots.is_empty() {
         println!("{}", "no provider roots found".yellow());
     } else {
-        println!("{} scanning {} provider root(s)", "OK".green(), existing_roots.len());
+        println!(
+            "{} scanning {} provider root(s)",
+            "OK".green(),
+            existing_roots.len()
+        );
         for (root, provider) in &existing_roots {
             println!("  {} ({})", root.display(), provider);
         }
     }
     let (discovered, collision_report) = discovery.discover()?;
     if !discovered.is_empty() {
-        let result = import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
+        let result =
+            import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
         println!(
             "{} imported {} skills from providers",
             "OK".green(),
@@ -202,6 +207,22 @@ fn init_human(target: &Path, args: &InitArgs) -> Result<()> {
                     err.path.display(),
                     err.message
                 );
+            }
+        }
+        if !result.warnings.is_empty() {
+            println!(
+                "{}: {} provider import lint warning(s)",
+                "WARNING".yellow(),
+                result.warnings.len()
+            );
+            for warning in &result.warnings {
+                println!("  {} ({})", warning.path.display(), warning.skill_id);
+                for diagnostic in &warning.diagnostics {
+                    println!("    - [{}] {}", diagnostic.severity, diagnostic.message);
+                    if let Some(suggestion) = diagnostic.suggestion.as_deref() {
+                        println!("      hint: {suggestion}");
+                    }
+                }
             }
         }
         seed_provider_sync_state(target, discovery.roots())?;
@@ -249,17 +270,20 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
     let archive = GitArchive::open(&archive_path)?;
     let search = SearchIndex::open(&index_path)?;
     let discovery = ProviderDiscovery::new();
-    let provider_roots: Vec<_> = discovery.roots().iter()
+    let provider_roots: Vec<_> = discovery
+        .roots()
+        .iter()
         .filter(|(p, _)| p.is_dir())
         .map(|(p, name)| serde_json::json!({"path": p.display().to_string(), "provider": name}))
         .collect();
     let (discovered, collision_report) = discovery.discover()?;
-    let provider_count = if discovered.is_empty() {
-        0
+    let (provider_count, provider_import_warnings) = if discovered.is_empty() {
+        (0, Vec::new())
     } else {
-        let result = import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
+        let result =
+            import_discovered_skills(discovered, collision_report, &archive, &db, &search, target)?;
         seed_provider_sync_state(target, discovery.roots())?;
-        result.imported.len()
+        (result.imported.len(), result.warnings)
     };
 
     // Sync provider roots to update cache state (disabled - ctx not available in init_robot)
@@ -284,6 +308,7 @@ fn init_robot(target: &Path, args: &InitArgs) -> Result<()> {
             "config": config_path.display().to_string(),
             "provider_roots_scanned": provider_roots.len(),
             "provider_skills_imported": provider_count,
+            "provider_import_warnings": provider_import_warnings,
         })
     );
 

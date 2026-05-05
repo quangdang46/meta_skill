@@ -827,3 +827,115 @@ This skill should appear after providers sync invalidates the route cache.
 
     Ok(())
 }
+
+/// bd-k6xi: oversized provider imports surface references guidance during init and sync
+#[test]
+fn test_provider_import_lint_surfaces_references_guidance() -> Result<()> {
+    let mut fixture = E2EFixture::new("provider_import_lint_guidance");
+    let claude_root = fixture.root.join(".claude/skills");
+    let oversized_body = "word ".repeat(5_200);
+
+    create_provider_skill(
+        &claude_root.join("oversized-init"),
+        &format!(
+            r#"---
+id: oversized-init
+name: Oversized Init
+description: Oversized provider skill imported during init
+tags: [provider, lint]
+trigger_phrases: ["init oversized route"]
+---
+# Oversized Init
+
+## Overview
+{}
+"#,
+            oversized_body
+        ),
+        &[],
+        &[],
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    fixture.assert_success(&init_out, "init");
+    let init_json = init_out.json();
+    let init_warnings = init_json["provider_import_warnings"]
+        .as_array()
+        .expect("provider_import_warnings");
+    assert!(
+        init_warnings.iter().any(|warning| {
+            warning["skill_id"] == "oversized-init"
+                && warning["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics")
+                    .iter()
+                    .any(|diag| {
+                        diag["rule_id"] == "oversized-skill-md"
+                            && diag["suggestion"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .contains("references/")
+                            && diag["suggestion"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .contains("trigger:init oversized route")
+                    })
+        }),
+        "init should surface oversized import guidance with references/ and trigger hints"
+    );
+
+    create_provider_skill(
+        &claude_root.join("oversized-sync"),
+        &format!(
+            r#"---
+id: oversized-sync
+name: Oversized Sync
+description: Oversized provider skill imported during providers sync
+tags: [provider, lint]
+trigger_phrases: ["sync oversized route"]
+---
+# Oversized Sync
+
+## Overview
+{}
+"#,
+            oversized_body
+        ),
+        &[],
+        &[],
+    )?;
+
+    let sync_out = fixture.run_ms(&["--robot", "providers", "sync", "--apply"]);
+    fixture.assert_success(&sync_out, "providers_sync_apply");
+    let sync_json = sync_out.json();
+    let reports = sync_json["roots"].as_array().expect("sync reports");
+    assert!(
+        reports.iter().any(|report| {
+            report["lint_warnings"]
+                .as_array()
+                .expect("lint warnings")
+                .iter()
+                .any(|warning| {
+                    warning["skill_id"] == "oversized-sync"
+                        && warning["diagnostics"]
+                            .as_array()
+                            .expect("diagnostics")
+                            .iter()
+                            .any(|diag| {
+                                diag["rule_id"] == "oversized-skill-md"
+                                    && diag["suggestion"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .contains("references/")
+                                    && diag["suggestion"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .contains("trigger:sync oversized route")
+                            })
+                })
+        }),
+        "providers sync should surface oversized import guidance with references/ and trigger hints"
+    );
+
+    Ok(())
+}

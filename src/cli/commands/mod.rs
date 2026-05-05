@@ -54,11 +54,13 @@ pub mod outcome;
 pub mod personalize;
 pub mod pre_commit;
 pub mod preferences;
+pub mod providers;
 pub mod prune;
 pub mod quality;
 pub mod recommend;
 pub mod remote;
 pub mod requirements;
+pub mod route;
 pub mod safety;
 pub mod search;
 pub mod security;
@@ -133,10 +135,12 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Simulate(args) => simulate::run(ctx, args),
         Commands::Quality(args) => quality::run(ctx, args),
         Commands::Recommend(args) => recommend::run(ctx, args),
+        Commands::Route(args) => route::run(ctx, args),
         Commands::Evidence(args) => evidence::run(ctx, args),
         Commands::Mcp(args) => mcp::run(ctx, args),
         Commands::Template(args) => template::run(ctx, args),
         Commands::Embed(args) => embed::run(ctx, args),
+        Commands::Providers(args) => providers::run(ctx, args),
     }
 }
 

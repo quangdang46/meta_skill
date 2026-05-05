@@ -620,6 +620,143 @@ impl ValidationRule for EmbeddingQualityRule {
     }
 }
 
+/// Rule that warns when SKILL.md exceeds the recommended word budget.
+///
+/// Beyond the word budget, skills become harder to route, load, and maintain.
+/// Long documents should be split into focused skills or have reference material
+/// moved into `references/`.
+pub struct OversizedSkillMdRule {
+    word_budget: usize,
+}
+
+impl Default for OversizedSkillMdRule {
+    fn default() -> Self {
+        Self { word_budget: 5000 }
+    }
+}
+
+impl OversizedSkillMdRule {
+    /// Create a rule with a custom word budget.
+    #[must_use]
+    pub const fn with_budget(words: usize) -> Self {
+        Self { word_budget: words }
+    }
+
+    /// Extract route-relevant metadata from description + trigger phrases.
+    #[must_use]
+    pub fn derive_route_metadata(&self, skill: &SkillSpec) -> Vec<String> {
+        let mut hints = Vec::new();
+
+        // From description: extract key terms
+        if !skill.metadata.description.is_empty() {
+            let significant: Vec<&str> = skill
+                .metadata
+                .description
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .take(8)
+                .collect();
+            if !significant.is_empty() {
+                hints.push(format!("desc: {}", significant.join(" ")));
+            }
+        }
+
+        // From tags
+        for tag in &skill.metadata.tags {
+            hints.push(format!("tag:{tag}"));
+        }
+
+        // From trigger phrases embedded in metadata
+        for phrase in &skill.metadata.trigger_phrases {
+            hints.push(format!("trigger:{phrase}"));
+        }
+
+        hints
+    }
+}
+
+impl ValidationRule for OversizedSkillMdRule {
+    fn id(&self) -> &'static str {
+        "oversized-skill-md"
+    }
+
+    fn name(&self) -> &'static str {
+        "Oversized SKILL.md"
+    }
+
+    fn description(&self) -> &'static str {
+        "SKILL.md exceeds the recommended word budget — consider splitting or moving content to references/"
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Quality
+    }
+
+    fn default_severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn validate(&self, ctx: &ValidationContext<'_>) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let skill = ctx.skill;
+
+        // Count total words across all sections
+        let total_words: usize = skill
+            .sections
+            .iter()
+            .flat_map(|s| &s.blocks)
+            .map(|b| b.content.split_whitespace().count())
+            .sum();
+
+        // Add metadata words
+        let meta_words = skill.metadata.description.split_whitespace().count()
+            + skill.metadata.name.split_whitespace().count();
+
+        let total = total_words + meta_words;
+
+        if total > self.word_budget {
+            let excess = total.saturating_sub(self.word_budget);
+            let route_hints = self.derive_route_metadata(skill);
+
+            let mut diag = Diagnostic::warning(
+                self.id(),
+                format!(
+                    "SKILL.md has ~{total} words ({excess} over {}-word budget)",
+                    self.word_budget
+                ),
+            )
+            .with_suggestion(format!(
+                "Split into focused skills or move reference material into `references/`. \
+                 Compact route metadata: [{}]",
+                route_hints.join(" | ")
+            ))
+            .with_category(RuleCategory::Quality);
+
+            // Point span to document start
+            diag = diag.with_span(crate::lint::diagnostic::SourceSpan::new(1, 1, 5, 1));
+
+            diagnostics.push(diag);
+        } else if total > self.word_budget * 4 / 5 {
+            // Approaching budget: info-level heads-up
+            diagnostics.push(
+                Diagnostic::info(
+                    self.id(),
+                    format!(
+                        "SKILL.md has ~{total} words (approaching {}-word budget)",
+                        self.word_budget
+                    ),
+                )
+                .with_suggestion(
+                    "Plan ahead: consider splitting or moving content to `references/`",
+                )
+                .with_category(RuleCategory::Quality),
+            );
+        }
+
+        diagnostics
+    }
+}
+
 // =============================================================================
 // RULE COLLECTION
 // =============================================================================
@@ -632,6 +769,7 @@ pub fn quality_rules() -> Vec<Box<dyn ValidationRule>> {
         Box::new(ActionableRulesRule::default()),
         Box::new(ExamplesHaveCodeRule),
         Box::new(BalancedContentRule::default()),
+        Box::new(OversizedSkillMdRule::default()),
     ]
 }
 
@@ -958,7 +1096,7 @@ mod tests {
     #[test]
     fn test_quality_rules_count() {
         let rules = quality_rules();
-        assert_eq!(rules.len(), 4);
+        assert_eq!(rules.len(), 5);
     }
 
     #[test]
@@ -970,7 +1108,7 @@ mod tests {
     #[test]
     fn test_all_rules_count() {
         let rules = quality_and_performance_rules();
-        assert_eq!(rules.len(), 6);
+        assert_eq!(rules.len(), 7);
     }
 
     #[test]
@@ -981,5 +1119,107 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), original_len, "All rule IDs must be unique");
+    }
+
+    // OversizedSkillMdRule tests
+
+    #[test]
+    fn test_oversized_skill_passes_for_small_skill() {
+        let rule = OversizedSkillMdRule::default();
+        let config = ValidationConfig::new();
+        let mut skill = SkillSpec::new("small", "Small Skill");
+        skill.metadata.description = "A small skill.".to_string();
+        // Only one small section - well under budget
+        skill.sections.push(SkillSection {
+            id: "intro".to_string(),
+            title: "Intro".to_string(),
+            blocks: vec![SkillBlock {
+                id: "b1".to_string(),
+                block_type: BlockType::Text,
+                content: "Short content.".to_string(),
+            }],
+        });
+        let ctx = ValidationContext::new(&skill, &config);
+        let diagnostics = rule.validate(&ctx);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_oversized_skill_warns_when_over_budget() {
+        let rule = OversizedSkillMdRule::with_budget(10); // very small budget
+        let config = ValidationConfig::new();
+        let mut skill = SkillSpec::new("big", "Big Skill");
+        skill.metadata.description = "A skill with a lot of text content.".to_string();
+        skill.sections.push(SkillSection {
+            id: "content".to_string(),
+            title: "Content".to_string(),
+            blocks: vec![SkillBlock {
+                id: "b1".to_string(),
+                block_type: BlockType::Text,
+                content: "word ".repeat(20).trim().to_string(),
+            }],
+        });
+        let ctx = ValidationContext::new(&skill, &config);
+        let diagnostics = rule.validate(&ctx);
+        assert!(!diagnostics.is_empty());
+        assert!(diagnostics[0].message.contains("over"));
+    }
+
+    #[test]
+    fn test_oversized_skill_info_when_approaching_budget() {
+        let rule = OversizedSkillMdRule::with_budget(20);
+        let config = ValidationConfig::new();
+        let mut skill = SkillSpec::new("medium", "Medium Skill");
+        skill.metadata.description = "A skill.".to_string();
+        skill.sections.push(SkillSection {
+            id: "content".to_string(),
+            title: "Content".to_string(),
+            blocks: vec![SkillBlock {
+                id: "b1".to_string(),
+                block_type: BlockType::Text,
+                content: "word ".repeat(17).trim().to_string(),
+            }],
+        });
+        let ctx = ValidationContext::new(&skill, &config);
+        let diagnostics = rule.validate(&ctx);
+        assert!(!diagnostics.is_empty());
+        // At 4/5 of budget, should be info severity
+        assert!(diagnostics[0].severity == Severity::Info);
+        assert!(diagnostics[0].message.contains("approaching"));
+    }
+
+    #[test]
+    fn test_derive_route_metadata_from_description() {
+        let rule = OversizedSkillMdRule::default();
+        let mut skill = SkillSpec::new("route-test", "Route Test");
+        skill.metadata.description =
+            "This skill helps with advanced error handling in Rust applications.".to_string();
+        skill.metadata.tags = vec!["rust".to_string(), "errors".to_string()];
+        let hints = rule.derive_route_metadata(&skill);
+        assert!(!hints.is_empty());
+        assert!(hints.iter().any(|h| h.starts_with("desc:")));
+        assert!(hints.iter().any(|h| h == "tag:rust"));
+        assert!(hints.iter().any(|h| h == "tag:errors"));
+    }
+
+    #[test]
+    fn test_derive_route_metadata_with_trigger_phrases() {
+        let rule = OversizedSkillMdRule::default();
+        let mut skill = SkillSpec::new("trigger-test", "Trigger Test");
+        skill.metadata.description = "Test skill.".to_string();
+        skill.metadata.tags = vec!["test".to_string()];
+        skill.metadata.trigger_phrases = vec!["error handling".to_string(), "panic".to_string()];
+        let hints = rule.derive_route_metadata(&skill);
+        assert!(hints.iter().any(|h| h == "trigger:error handling"));
+        assert!(hints.iter().any(|h| h == "trigger:panic"));
+    }
+
+    #[test]
+    fn test_oversized_rule_id_and_name() {
+        let rule = OversizedSkillMdRule::default();
+        assert_eq!(rule.id(), "oversized-skill-md");
+        assert_eq!(rule.category(), RuleCategory::Quality);
+        assert_eq!(rule.default_severity(), Severity::Warning);
+        assert!(!rule.can_fix());
     }
 }

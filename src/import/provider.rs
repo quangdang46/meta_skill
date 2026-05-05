@@ -23,6 +23,8 @@ use crate::core::skill::{
 };
 use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
+use crate::lint::rules::OversizedSkillMdRule;
+use crate::lint::{Diagnostic, ValidationConfig, ValidationContext, ValidationRule};
 use crate::search::SearchIndex;
 use crate::storage::{Database, GitArchive, SkillRecord};
 use chrono::Utc;
@@ -57,6 +59,8 @@ pub struct ImportResult {
     pub imported: Vec<ImportEntry>,
     /// Skills that failed to import
     pub errors: Vec<ImportError>,
+    /// Non-blocking import lint diagnostics surfaced during provider import.
+    pub warnings: Vec<ImportWarning>,
     /// Total skills discovered
     pub discovered_count: usize,
     /// Collision report for duplicate skill IDs across providers
@@ -85,6 +89,19 @@ pub struct ImportError {
     pub path: PathBuf,
     /// Error message
     pub message: String,
+}
+
+/// Non-blocking diagnostics discovered while importing a provider skill.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportWarning {
+    /// Provider name
+    pub provider: String,
+    /// Skill ID within the provider
+    pub skill_id: String,
+    /// Path to the imported provider SKILL.md
+    pub path: PathBuf,
+    /// Diagnostics emitted for this imported skill
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Provider discovery engine.
@@ -248,6 +265,7 @@ pub fn import_discovered_skills(
     let mut result = ImportResult {
         imported: Vec::new(),
         errors: Vec::new(),
+        warnings: Vec::new(),
         discovered_count: discovered.len(),
         collision_report,
     };
@@ -265,8 +283,26 @@ pub fn import_discovered_skills(
             .get(&skill.provider)
             .cloned()
             .unwrap_or_default();
+        let warnings = collect_import_warnings(&skill);
 
-        match import_single_skill(&skill, &same_provider_ids, &result.collision_report, archive, db, search, ms_root) {
+        if !warnings.is_empty() {
+            result.warnings.push(ImportWarning {
+                provider: skill.provider.clone(),
+                skill_id: skill.spec.metadata.id.clone(),
+                path: skill.provider_path.clone(),
+                diagnostics: warnings,
+            });
+        }
+
+        match import_single_skill(
+            &skill,
+            &same_provider_ids,
+            &result.collision_report,
+            archive,
+            db,
+            search,
+            ms_root,
+        ) {
             Ok(entry) => result.imported.push(entry),
             Err(e) => {
                 result.errors.push(ImportError {
@@ -295,10 +331,12 @@ fn import_single_skill(
     let skill_id = skill.spec.metadata.id.clone();
 
     let mut archived_spec = skill.spec.clone();
+    ensure_compact_route_metadata(&mut archived_spec);
     archived_spec.metadata.provider = skill.provider.clone();
     let canonical = crate::core::ids::CanonicalId::new(&skill.provider, &skill_id);
     archived_spec.metadata.canonical_id = canonical.to_canonical_string();
-    archived_spec.metadata.display_id = canonical.display(is_unambiguous(&skill_id, collision_report));
+    archived_spec.metadata.display_id =
+        canonical.display(is_unambiguous(&skill_id, collision_report));
     canonicalize_provider_references(&mut archived_spec, same_provider_ids);
     archived_spec.archive_format_version = Some(SkillSpec::ARCHIVE_FORMAT_VERSION.to_string());
     archived_spec.provenance = Some(SkillProvenance {
@@ -378,6 +416,62 @@ fn import_single_skill(
         provider_path: skill.provider_path.clone(),
         imported_at: now,
     })
+}
+
+fn collect_import_warnings(skill: &DiscoveredSkill) -> Vec<Diagnostic> {
+    let mut spec = skill.spec.clone();
+    ensure_compact_route_metadata(&mut spec);
+
+    let config = ValidationConfig::new();
+    let rule = OversizedSkillMdRule::default();
+    let ctx = ValidationContext::new(&spec, &config).with_file_path(&skill.provider_path);
+    rule.validate(&ctx)
+}
+
+fn ensure_compact_route_metadata(spec: &mut SkillSpec) {
+    if !spec.metadata.keywords.is_empty() {
+        return;
+    }
+
+    let rule = OversizedSkillMdRule::default();
+    let mut seen = HashSet::new();
+    let mut keywords = Vec::new();
+
+    for hint in rule.derive_route_metadata(spec) {
+        let value = hint
+            .strip_prefix("desc:")
+            .or_else(|| hint.strip_prefix("tag:"))
+            .or_else(|| hint.strip_prefix("trigger:"))
+            .unwrap_or(hint.as_str())
+            .trim();
+        push_route_keyword(&mut keywords, &mut seen, value);
+    }
+
+    spec.metadata.keywords = keywords;
+}
+
+fn push_route_keyword(keywords: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    if let Some(normalized) = normalize_route_keyword(value) {
+        if seen.insert(normalized.clone()) {
+            keywords.push(normalized);
+        }
+    }
+}
+
+fn normalize_route_keyword(value: &str) -> Option<String> {
+    let normalized = value
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 /// Find all SKILL.md files recursively under a root directory.
@@ -752,14 +846,17 @@ mod tests {
         assert!(missing.is_empty());
     }
 
-
     #[test]
     fn test_discover_returns_collision_report() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("skills");
         fs::create_dir_all(&root).unwrap();
 
-        create_skill_md(&root, "rust-errors", "# Rust Errors\n\n## Rules\n\n- Handle errors\n");
+        create_skill_md(
+            &root,
+            "rust-errors",
+            "# Rust Errors\n\n## Rules\n\n- Handle errors\n",
+        );
 
         let discovery = ProviderDiscovery::with_roots(vec![(root, "claude".into())]);
         let (skills, report) = discovery.discover().unwrap();
@@ -783,10 +880,7 @@ mod tests {
 
     #[test]
     fn test_collision_report_detects_duplicates() {
-        let skills: Vec<(&str, &str)> = vec![
-            ("claude", "shared-id"),
-            ("codex", "shared-id"),
-        ];
+        let skills: Vec<(&str, &str)> = vec![("claude", "shared-id"), ("codex", "shared-id")];
         let report = detect_collisions(skills);
         assert!(report.has_collisions);
         assert_eq!(report.len(), 1);
@@ -796,8 +890,16 @@ mod tests {
         assert_eq!(collision.providers.len(), 2);
         assert!(collision.providers.contains(&"claude".to_string()));
         assert!(collision.providers.contains(&"codex".to_string()));
-        assert!(collision.canonical_ids.contains(&"claude/shared-id".to_string()));
-        assert!(collision.canonical_ids.contains(&"codex/shared-id".to_string()));
+        assert!(
+            collision
+                .canonical_ids
+                .contains(&"claude/shared-id".to_string())
+        );
+        assert!(
+            collision
+                .canonical_ids
+                .contains(&"codex/shared-id".to_string())
+        );
     }
 
     // ===================== Archive Integrity (bd-28jh) =====================
@@ -844,8 +946,14 @@ mod tests {
 
         assert_eq!(assets.scripts[0].path, PathBuf::from("scripts/run.sh"));
         assert_eq!(assets.scripts[1].path, PathBuf::from("scripts/setup.sh"));
-        assert_eq!(assets.references[0].path, PathBuf::from("references/readme.md"));
-        assert_eq!(assets.references[1].path, PathBuf::from("references/api.yaml"));
+        assert_eq!(
+            assets.references[0].path,
+            PathBuf::from("references/readme.md")
+        );
+        assert_eq!(
+            assets.references[1].path,
+            PathBuf::from("references/api.yaml")
+        );
     }
 
     #[test]
@@ -854,5 +962,77 @@ mod tests {
         assert!(assets.scripts.is_empty());
         assert!(assets.references.is_empty());
         assert!(assets.tests.is_empty());
+    }
+
+    #[test]
+    fn test_collect_import_warnings_surfaces_references_guidance() {
+        let mut spec = SkillSpec::new("oversized", "Oversized Skill");
+        spec.metadata.description = "A provider skill with a very large main body.".to_string();
+        spec.metadata.trigger_phrases = vec!["provider import warning".to_string()];
+        spec.sections.push(crate::core::skill::SkillSection {
+            id: "overview".to_string(),
+            title: "Overview".to_string(),
+            blocks: vec![crate::core::skill::SkillBlock {
+                id: "overview-1".to_string(),
+                block_type: BlockType::Text,
+                content: "word ".repeat(5_100).trim().to_string(),
+            }],
+        });
+
+        let skill = DiscoveredSkill {
+            provider: "claude".to_string(),
+            provider_path: PathBuf::from("/tmp/provider/oversized/SKILL.md"),
+            spec,
+            scripts: Vec::new(),
+            references: Vec::new(),
+        };
+
+        let warnings = collect_import_warnings(&skill);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].rule_id, "oversized-skill-md");
+        assert!(
+            warnings[0]
+                .suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("references/")
+        );
+        assert!(
+            warnings[0]
+                .suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("trigger:provider import warning")
+        );
+    }
+
+    #[test]
+    fn test_ensure_compact_route_metadata_derives_keywords() {
+        let mut spec = SkillSpec::new("route-meta", "Route Meta");
+        spec.metadata.description =
+            "Advanced Rust error handling patterns for async services.".to_string();
+        spec.metadata.tags = vec!["rust".to_string(), "async".to_string()];
+        spec.metadata.trigger_phrases = vec!["error handling".to_string()];
+
+        ensure_compact_route_metadata(&mut spec);
+
+        assert!(
+            spec.metadata
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "advanced rust error handling patterns async services")
+        );
+        assert!(
+            spec.metadata
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "rust")
+        );
+        assert!(
+            spec.metadata
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "error handling")
+        );
     }
 }

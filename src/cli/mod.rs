@@ -290,6 +290,9 @@ pub enum Commands {
     /// View and tune recommendation engine (stats/history/tune)
     Recommend(commands::recommend::RecommendArgs),
 
+    /// Route a task description to the best matching skills
+    Route(commands::route::RouteArgs),
+
     /// View and manage skill provenance evidence
     Evidence(commands::evidence::EvidenceArgs),
 
@@ -304,4 +307,7 @@ pub enum Commands {
 
     /// Test embedding backends
     Embed(commands::embed::EmbedArgs),
+
+    /// Manage provider roots for skill sources
+    Providers(commands::providers::ProvidersArgs),
 }
