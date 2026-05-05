@@ -1,4 +1,4 @@
-//! Beads (bd) version parsing and compatibility checks.
+//! Beads CLI version parsing and compatibility checks.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use crate::error::{MsError, Result};
 
-/// Semantic version for bd binary.
+/// Semantic version for the beads CLI binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BeadsVersion {
     pub major: u32,
@@ -74,13 +74,13 @@ impl PartialOrd for BeadsVersion {
     }
 }
 
-/// Minimum bd version this client supports.
+/// Minimum beads CLI version this client supports.
 pub static MINIMUM_SUPPORTED_VERSION: LazyLock<BeadsVersion> =
-    LazyLock::new(|| BeadsVersion::new(0, 9, 0));
+    LazyLock::new(|| BeadsVersion::new(0, 1, 0));
 
-/// Recommended bd version for full feature support.
+/// Recommended beads CLI version for full feature support.
 pub static RECOMMENDED_VERSION: LazyLock<BeadsVersion> =
-    LazyLock::new(|| BeadsVersion::new(1, 0, 0));
+    LazyLock::new(|| BeadsVersion::new(0, 1, 12));
 
 #[derive(Debug, Clone)]
 pub enum VersionCompatibility {
@@ -109,7 +109,11 @@ fn extract_version_fragment(input: &str) -> Option<String> {
         }
     }
 
-    if started { Some(out) } else { None }
+    if started {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +124,9 @@ mod tests {
     fn test_version_parsing() {
         let v = BeadsVersion::parse("bd version 1.2.3").unwrap();
         assert_eq!(v, BeadsVersion::new(1, 2, 3));
+
+        let v = BeadsVersion::parse("br version 0.1.12 (release) (main@745c0bf)").unwrap();
+        assert_eq!(v, BeadsVersion::new(0, 1, 12));
 
         let v = BeadsVersion::parse("0.9.15-abc123").unwrap();
         assert_eq!(v, BeadsVersion::new(0, 9, 15));

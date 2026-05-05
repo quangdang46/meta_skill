@@ -11,6 +11,10 @@ use tempfile::TempDir;
 
 use crate::beads::{BeadsClient, CreateIssueRequest, IssueStatus, TestLogger, WorkFilter};
 
+fn detect_beads_binary() -> PathBuf {
+    super::client::resolved_default_beads_binary()
+}
+
 /// Test fixture that creates an isolated beads environment.
 ///
 /// SAFETY: Uses tempdir + BEADS_DB override to completely isolate tests.
@@ -19,6 +23,8 @@ pub struct TestBeadsEnv {
     pub temp_dir: TempDir,
     /// Path to the test database
     db_path: PathBuf,
+    /// CLI binary used for this test environment
+    beads_bin: PathBuf,
     /// Test logger for this environment
     pub log: TestLogger,
     /// Whether bd was successfully initialized
@@ -34,6 +40,7 @@ impl TestBeadsEnv {
         let beads_dir = temp_dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("Failed to create .beads directory");
         let db_path = beads_dir.join("beads.db");
+        let beads_bin = detect_beads_binary();
 
         log.info(
             "SETUP",
@@ -43,7 +50,7 @@ impl TestBeadsEnv {
 
         // Initialize database using env var
         log.info("INIT", "Initializing test database", None);
-        let status = Command::new("bd")
+        let status = Command::new(&beads_bin)
             .args(["init"])
             .env("BEADS_DB", &db_path)
             .current_dir(temp_dir.path())
@@ -56,11 +63,11 @@ impl TestBeadsEnv {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                log.warn("INIT", &format!("bd init warning: {}", stderr), None);
+                log.warn("INIT", &format!("beads init warning: {}", stderr), None);
                 false
             }
             Err(e) => {
-                log.warn("INIT", &format!("bd init failed: {}", e), None);
+                log.warn("INIT", &format!("beads init failed: {}", e), None);
                 false
             }
         };
@@ -70,6 +77,7 @@ impl TestBeadsEnv {
         TestBeadsEnv {
             temp_dir,
             db_path,
+            beads_bin,
             log,
             initialized,
         }
@@ -77,7 +85,7 @@ impl TestBeadsEnv {
 
     /// Get a BeadsClient configured for this test environment.
     pub fn client(&self) -> BeadsClient {
-        BeadsClient::new()
+        BeadsClient::with_binary(&self.beads_bin)
             .with_work_dir(self.temp_dir.path())
             .with_env("BEADS_DB", self.db_path.to_string_lossy())
     }
@@ -89,11 +97,15 @@ impl Drop for TestBeadsEnv {
     }
 }
 
-/// Count running bd processes.
-fn count_bd_processes() -> usize {
-    // Use pgrep to count bd processes, handling errors gracefully
+/// Count running beads CLI processes.
+fn count_beads_processes(binary: &PathBuf) -> usize {
+    let Some(process_name) = binary.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+
+    // Use pgrep to count processes, handling errors gracefully.
     Command::new("pgrep")
-        .args(["-c", "bd"])
+        .args(["-c", process_name])
         .output()
         .ok()
         .and_then(|o| {
@@ -119,15 +131,15 @@ fn test_no_orphan_processes() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
     // Get baseline process count
-    let before = count_bd_processes();
+    let before = count_beads_processes(&env.beads_bin);
     log.info(
         "BASELINE",
-        &format!("bd processes before: {}", before),
+        &format!("beads processes before: {}", before),
         None,
     );
 
@@ -142,8 +154,8 @@ fn test_no_orphan_processes() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Verify no orphans
-    let after = count_bd_processes();
-    log.info("VERIFY", &format!("bd processes after: {}", after), None);
+    let after = count_beads_processes(&env.beads_bin);
+    log.info("VERIFY", &format!("beads processes after: {}", after), None);
 
     // Should be same or fewer (daemon may be running)
     assert!(
@@ -162,7 +174,7 @@ fn test_wal_integrity_during_operations() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -229,7 +241,7 @@ fn test_operation_continuity() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -283,7 +295,7 @@ fn test_operation_continuity() {
                     &format!("Database corruption detected: {}", e),
                     None,
                 );
-                panic!("Database appears corrupted: {}", e);
+                assert!(false, "Database appears corrupted: {}", e);
             } else {
                 log.warn(
                     "SKIP",
@@ -302,7 +314,7 @@ fn test_sync_persistence() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -362,7 +374,7 @@ fn test_database_lock_detection_via_flock() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -440,7 +452,7 @@ fn test_wal_files_not_deleted_during_operations() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -511,7 +523,7 @@ fn test_rapid_create_operations() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 

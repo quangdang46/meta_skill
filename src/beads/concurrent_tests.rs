@@ -17,10 +17,15 @@ use tempfile::TempDir;
 
 use crate::beads::{BeadsClient, CreateIssueRequest, TestLogger, WorkFilter};
 
+fn detect_beads_binary() -> PathBuf {
+    super::client::resolved_default_beads_binary()
+}
+
 /// Test fixture for concurrent tests (similar to WAL tests).
 struct ConcurrentTestEnv {
     temp_dir: TempDir,
     db_path: PathBuf,
+    beads_bin: PathBuf,
     #[allow(dead_code)]
     log: TestLogger,
     initialized: bool,
@@ -34,6 +39,7 @@ impl ConcurrentTestEnv {
         let beads_dir = temp_dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("Failed to create .beads directory");
         let db_path = beads_dir.join("beads.db");
+        let beads_bin = detect_beads_binary();
 
         log.info(
             "SETUP",
@@ -43,7 +49,7 @@ impl ConcurrentTestEnv {
 
         // Initialize database
         log.info("INIT", "Initializing test database", None);
-        let status = Command::new("bd")
+        let status = Command::new(&beads_bin)
             .args(["init"])
             .env("BEADS_DB", &db_path)
             .current_dir(temp_dir.path())
@@ -56,11 +62,11 @@ impl ConcurrentTestEnv {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                log.warn("INIT", &format!("bd init warning: {}", stderr), None);
+                log.warn("INIT", &format!("beads init warning: {}", stderr), None);
                 false
             }
             Err(e) => {
-                log.warn("INIT", &format!("bd init failed: {}", e), None);
+                log.warn("INIT", &format!("beads init failed: {}", e), None);
                 false
             }
         };
@@ -68,13 +74,14 @@ impl ConcurrentTestEnv {
         ConcurrentTestEnv {
             temp_dir,
             db_path,
+            beads_bin,
             log,
             initialized,
         }
     }
 
     fn client(&self) -> BeadsClient {
-        BeadsClient::new()
+        BeadsClient::with_binary(&self.beads_bin)
             .with_work_dir(self.temp_dir.path())
             .with_env("BEADS_DB", self.db_path.to_string_lossy())
     }
@@ -99,7 +106,7 @@ fn test_serial_access_baseline() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -168,7 +175,7 @@ fn test_concurrent_reads() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -254,7 +261,7 @@ fn test_concurrent_writes_no_corruption() {
     let env = ConcurrentTestEnv::new("test_concurrent_writes");
 
     if !env.client().is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -355,7 +362,7 @@ fn test_sync_after_each_agent_pattern() {
     let env = ConcurrentTestEnv::new("test_sync_pattern");
 
     if !env.client().is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -444,7 +451,7 @@ fn test_failure_detection() {
     let client = env.client();
 
     if !client.is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -489,7 +496,7 @@ fn test_interleaved_read_write() {
     let env = ConcurrentTestEnv::new("test_interleaved_rw");
 
     if !env.client().is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 
@@ -588,7 +595,7 @@ fn test_stress_rapid_concurrent_ops() {
     let env = ConcurrentTestEnv::new("test_stress");
 
     if !env.client().is_available() {
-        log.warn("SKIP", "bd not available", None);
+        log.warn("SKIP", "beads CLI not available", None);
         return;
     }
 

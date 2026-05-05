@@ -1,4 +1,4 @@
-//! `BeadsClient` - CLI wrapper for the beads (bd) issue tracker.
+//! `BeadsClient` - CLI wrapper for the beads issue tracker.
 //!
 //! Provides programmatic access to beads using the `--json` flag
 //! for structured output, following the same patterns as `CassClient` and `UbsClient`.
@@ -12,14 +12,40 @@ use crate::security::SafetyGate;
 
 use super::types::{CreateIssueRequest, Issue, IssueStatus, UpdateIssueRequest, WorkFilter};
 use super::version::{
-    BeadsVersion, MINIMUM_SUPPORTED_VERSION, RECOMMENDED_VERSION, VersionCompatibility,
+    BeadsVersion, VersionCompatibility, MINIMUM_SUPPORTED_VERSION, RECOMMENDED_VERSION,
 };
+
+const BEADS_BIN_ENV: &str = "BEADS_BIN";
+
+fn command_available(binary: &str) -> bool {
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub(crate) fn resolved_default_beads_binary() -> PathBuf {
+    if let Some(binary) = std::env::var_os(BEADS_BIN_ENV) {
+        if !binary.is_empty() {
+            return PathBuf::from(binary);
+        }
+    }
+
+    for candidate in ["br", "bd"] {
+        if command_available(candidate) {
+            return PathBuf::from(candidate);
+        }
+    }
+
+    PathBuf::from("br")
+}
 
 /// Client for interacting with the beads (bd) issue tracker.
 #[derive(Debug, Clone)]
 pub struct BeadsClient {
-    /// Path to bd binary (default: "bd")
-    bd_bin: PathBuf,
+    /// Path to the beads CLI binary (default: autodetect `br`, fallback `bd`)
+    beads_bin: PathBuf,
 
     /// Working directory for bd commands (uses current dir if None)
     work_dir: Option<PathBuf>,
@@ -36,7 +62,7 @@ impl BeadsClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bd_bin: PathBuf::from("bd"),
+            beads_bin: resolved_default_beads_binary(),
             work_dir: None,
             env: HashMap::new(),
             safety: None,
@@ -46,7 +72,7 @@ impl BeadsClient {
     /// Create a `BeadsClient` with a custom binary path.
     pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
         Self {
-            bd_bin: binary.into(),
+            beads_bin: binary.into(),
             work_dir: None,
             env: HashMap::new(),
             safety: None,
@@ -75,7 +101,7 @@ impl BeadsClient {
     /// Check if beads is available and responsive.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        let mut cmd = Command::new(&self.bd_bin);
+        let mut cmd = Command::new(&self.beads_bin);
         cmd.arg("--version");
         if let Some(ref dir) = self.work_dir {
             cmd.current_dir(dir);
@@ -94,7 +120,7 @@ impl BeadsClient {
     /// Get beads version.
     #[must_use]
     pub fn version(&self) -> Option<String> {
-        let mut cmd = Command::new(&self.bd_bin);
+        let mut cmd = Command::new(&self.beads_bin);
         cmd.arg("--version");
         if let Some(ref dir) = self.work_dir {
             cmd.current_dir(dir);
@@ -126,7 +152,7 @@ impl BeadsClient {
 
         let raw = self
             .version()
-            .ok_or_else(|| MsError::BeadsUnavailable("bd version not available".to_string()))?;
+            .ok_or_else(|| MsError::BeadsUnavailable("beads version not available".to_string()))?;
         BeadsVersion::parse(&raw)
     }
 
@@ -137,7 +163,7 @@ impl BeadsClient {
         if version < *MINIMUM_SUPPORTED_VERSION {
             return Ok(VersionCompatibility::Unsupported {
                 error: format!(
-                    "bd {} is older than minimum supported {}. Please upgrade.",
+                    "beads CLI {} is older than minimum supported {}. Please upgrade.",
                     version, *MINIMUM_SUPPORTED_VERSION
                 ),
             });
@@ -146,7 +172,7 @@ impl BeadsClient {
         if version < *RECOMMENDED_VERSION {
             return Ok(VersionCompatibility::Partial {
                 warning: format!(
-                    "bd {} is older than recommended {}. Some features may not work.",
+                    "beads CLI {} is older than recommended {}. Some features may not work.",
                     version, *RECOMMENDED_VERSION
                 ),
             });
@@ -397,7 +423,7 @@ impl BeadsClient {
     pub fn doctor(&self) -> Result<bool> {
         // We use output() directly instead of run_command because doctor might fail (exit non-zero)
         // and we want to capture that as a boolean, not an Err.
-        let mut cmd = Command::new(&self.bd_bin);
+        let mut cmd = Command::new(&self.beads_bin);
         cmd.arg("doctor");
         if let Some(ref dir) = self.work_dir {
             cmd.current_dir(dir);
@@ -450,9 +476,9 @@ impl BeadsClient {
         }
     }
 
-    /// Run a bd command and return stdout.
+    /// Run a beads CLI command and return stdout.
     fn run_command(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = Command::new(&self.bd_bin);
+        let mut cmd = Command::new(&self.beads_bin);
         cmd.args(args);
 
         if let Some(ref dir) = self.work_dir {
@@ -631,14 +657,14 @@ mod tests {
     #[test]
     fn test_beads_client_creation() {
         let client = BeadsClient::new();
-        assert_eq!(client.bd_bin, PathBuf::from("bd"));
+        assert_eq!(client.beads_bin, resolved_default_beads_binary());
     }
 
     #[test]
     fn test_beads_client_builder() {
         let client =
             BeadsClient::with_binary("/usr/local/bin/bd").with_work_dir("/data/projects/test");
-        assert_eq!(client.bd_bin, PathBuf::from("/usr/local/bin/bd"));
+        assert_eq!(client.beads_bin, PathBuf::from("/usr/local/bin/bd"));
         assert_eq!(client.work_dir, Some(PathBuf::from("/data/projects/test")));
     }
 
@@ -700,7 +726,7 @@ mod tests {
 
 /// Integration tests for BeadsClient.
 ///
-/// These tests require a real `bd` binary and use isolated test environments.
+/// These tests require a real beads CLI binary and use isolated test environments.
 /// Run with: `cargo test --package meta_skill beads::client::integration_tests`
 #[cfg(test)]
 mod integration_tests {
@@ -724,7 +750,7 @@ mod integration_tests {
         db_path: PathBuf,
         /// Test logger for this environment
         log: TestLogger,
-        /// Whether bd was successfully initialized
+        /// Whether the beads CLI was successfully initialized
         #[allow(dead_code)]
         initialized: bool,
     }
@@ -736,14 +762,16 @@ mod integration_tests {
         fn new(test_name: &str) -> Option<Self> {
             let mut log = TestLogger::new(test_name);
 
-            // Check if bd is available first
-            if !Command::new("bd")
+            let beads_bin = resolved_default_beads_binary();
+
+            // Check if the beads CLI is available first
+            if !Command::new(&beads_bin)
                 .arg("--version")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
             {
-                log.warn("SKIP", "bd not available, skipping test", None);
+                log.warn("SKIP", "beads CLI not available, skipping test", None);
                 return None;
             }
 
@@ -762,7 +790,7 @@ mod integration_tests {
             );
 
             // Initialize database using env var
-            let init_status = Command::new("bd")
+            let init_status = Command::new(&beads_bin)
                 .args(["init"])
                 .env("BEADS_DB", &db_path)
                 .current_dir(&project_dir)
@@ -775,11 +803,11 @@ mod integration_tests {
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    log.error("INIT", &format!("bd init failed: {}", stderr), None);
+                    log.error("INIT", &format!("beads init failed: {}", stderr), None);
                     return None;
                 }
                 Err(e) => {
-                    log.error("INIT", &format!("Failed to run bd: {}", e), None);
+                    log.error("INIT", &format!("Failed to run beads CLI: {}", e), None);
                     return None;
                 }
             };
@@ -823,13 +851,13 @@ mod integration_tests {
     #[test]
     fn test_is_available_with_real_bd() {
         let Some(mut env) = TestBeadsEnv::new("test_is_available") else {
-            return; // Skip if bd not available
+            return; // Skip if beads CLI not available
         };
         let client = env.client();
 
         assert!(
             client.is_available(),
-            "bd should be available in test environment"
+            "beads CLI should be available in test environment"
         );
         env.log()
             .success("VERIFY", "is_available() returns true", None);
@@ -1198,7 +1226,7 @@ mod integration_tests {
 
         let client = BeadsClient::new();
         if !client.is_available() {
-            log.warn("SKIP", "bd not available", None);
+            log.warn("SKIP", "beads CLI not available", None);
             return;
         }
 
@@ -1206,7 +1234,7 @@ mod integration_tests {
         assert!(version.is_some(), "Should be able to get version");
 
         let version_str = version.unwrap();
-        log.info("VERSION", &format!("bd version: {}", version_str), None);
+        log.info("VERSION", &format!("beads version: {}", version_str), None);
         assert!(!version_str.is_empty(), "Version should not be empty");
 
         log.success("VERSION", "Version check works", None);
@@ -1218,7 +1246,7 @@ mod integration_tests {
 
         let client = BeadsClient::new();
         if !client.is_available() {
-            log.warn("SKIP", "bd not available", None);
+            log.warn("SKIP", "beads CLI not available", None);
             return;
         }
 
@@ -1234,7 +1262,7 @@ mod integration_tests {
                 log.warn("COMPAT", &warning, None);
             }
             VersionCompatibility::Unsupported { error } => {
-                panic!("Unsupported version: {}", error);
+                assert!(false, "Unsupported version: {}", error);
             }
         }
     }

@@ -1,6 +1,6 @@
 //! E2E test binary for beads integration
 //!
-//! Run with: cargo run --bin `test_beads_e2e`
+//! Run with: cargo run --features beads-e2e-bin --bin `test_beads_e2e`
 
 use std::process::Command;
 use std::time::Instant;

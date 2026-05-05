@@ -1,9 +1,9 @@
 //! Real Beads Integration Tests
 //!
-//! These tests verify BeadsClient behavior using actual `bd` commands in isolated
+//! These tests verify BeadsClient behavior using the actual beads CLI in isolated
 //! temporary environments. Unlike the mock client tests, these tests:
 //!
-//! - Execute real `bd` CLI commands
+//! - Execute real `br`/`bd` CLI commands
 //! - Create actual SQLite databases with WAL
 //! - Test concurrent access patterns
 //! - Verify data persistence
@@ -30,8 +30,8 @@
 //!
 //! # Requirements
 //!
-//! - `bd` CLI must be installed and in PATH
-//! - Tests are automatically skipped if `bd` is not available
+//! - `br` or `bd` CLI must be installed and in PATH
+//! - Tests are automatically skipped if the beads CLI is not available
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -42,6 +42,27 @@ use ms::beads::{
     BeadsClient, CreateIssueRequest, IssueStatus, IssueType, UpdateIssueRequest, WorkFilter,
 };
 use tempfile::TempDir;
+
+fn detect_beads_binary() -> Option<String> {
+    if let Ok(configured) = std::env::var("BEADS_BIN") {
+        if !configured.is_empty() {
+            return Some(configured);
+        }
+    }
+
+    for candidate in ["br", "bd"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
 
 // =============================================================================
 // Test Fixture
@@ -59,25 +80,21 @@ struct RealBeadsEnv {
     project_dir: PathBuf,
     /// Path to the test database
     db_path: PathBuf,
-    /// Whether bd was successfully initialized
+    /// CLI binary used for this test environment
+    beads_bin: String,
+    /// Whether the beads CLI was successfully initialized
     initialized: bool,
 }
 
 impl RealBeadsEnv {
     /// Create a new isolated test environment.
     ///
-    /// Returns None if bd is not available.
+    /// Returns None if the beads CLI is not available.
     fn new(test_name: &str) -> Option<Self> {
-        // Check if bd is available
-        if !Command::new("bd")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            eprintln!("[{}] SKIP: bd not available", test_name);
+        let Some(beads_bin) = detect_beads_binary() else {
+            eprintln!("[{}] SKIP: beads CLI not available", test_name);
             return None;
-        }
+        };
 
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
         let project_dir = temp_dir.path().join("project");
@@ -88,7 +105,7 @@ impl RealBeadsEnv {
         let db_path = beads_dir.join("beads.db");
 
         // Initialize database using BEADS_DB env var
-        let init_status = Command::new("bd")
+        let init_status = Command::new(&beads_bin)
             .args(["init"])
             .env("BEADS_DB", &db_path)
             .current_dir(&project_dir)
@@ -98,11 +115,11 @@ impl RealBeadsEnv {
             Ok(output) if output.status.success() => true,
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("[{}] bd init failed: {}", test_name, stderr);
+                eprintln!("[{}] beads init failed: {}", test_name, stderr);
                 false
             }
             Err(e) => {
-                eprintln!("[{}] Failed to run bd init: {}", test_name, e);
+                eprintln!("[{}] Failed to run beads init: {}", test_name, e);
                 false
             }
         };
@@ -111,13 +128,14 @@ impl RealBeadsEnv {
             temp_dir,
             project_dir,
             db_path,
+            beads_bin,
             initialized,
         })
     }
 
     /// Get a BeadsClient configured for this test environment.
     fn client(&self) -> BeadsClient {
-        BeadsClient::new()
+        BeadsClient::with_binary(&self.beads_bin)
             .with_work_dir(&self.project_dir)
             .with_env("BEADS_DB", self.db_path.to_string_lossy())
     }
@@ -145,6 +163,34 @@ fn test_real_beads_availability() {
 
     let client = env.client();
     assert!(client.is_available(), "bd should be available");
+}
+
+#[test]
+fn test_real_beads_temp_dir_cleanup() {
+    let temp_path = {
+        let Some(env) = RealBeadsEnv::new("test_temp_cleanup") else {
+            return;
+        };
+        if !env.initialized {
+            return;
+        }
+
+        let temp_path = env.temp_dir.path().to_path_buf();
+        let client = env.client();
+        let _issue = client
+            .create(&CreateIssueRequest::new("Cleanup Verification"))
+            .expect("Create should succeed");
+        assert!(
+            temp_path.exists(),
+            "Temp test directory should exist during test"
+        );
+        temp_path
+    };
+
+    assert!(
+        !temp_path.exists(),
+        "Temp test directory should be removed after env drop"
+    );
 }
 
 #[test]
