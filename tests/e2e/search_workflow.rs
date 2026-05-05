@@ -61,14 +61,14 @@ fn setup_search_fixture(scenario: &str) -> Result<E2EFixture> {
         "--robot",
         "config",
         "skill_paths.global",
-        r#"[\"./global_skills\"]"#,
+        r#"["./global_skills"]"#,
     ]);
     fixture.assert_success(&output, "config skill_paths.global");
     let output = fixture.run_ms(&[
         "--robot",
         "config",
         "skill_paths.local",
-        r#"[\"./local_skills\"]"#,
+        r#"["./local_skills"]"#,
     ]);
     fixture.assert_success(&output, "config skill_paths.local");
 
@@ -234,8 +234,14 @@ fn test_search_filters_layers() -> Result<()> {
 fn test_search_ranking() -> Result<()> {
     let mut fixture = setup_search_fixture("search_ranking")?;
 
-    fixture.log_step("Search ranking by term frequency");
-    let output = fixture.run_ms(&["--robot", "search", "commonterm", "--search-type", "bm25"]);
+    fixture.log_step("Search ranking by combined relevance");
+    let output = fixture.run_ms(&[
+        "--robot",
+        "search",
+        "bananacore commonterm",
+        "--search-type",
+        "bm25",
+    ]);
     fixture.assert_success(&output, "search ranking");
 
     let json = output.json();
@@ -244,7 +250,7 @@ fn test_search_ranking() -> Result<()> {
     let top_id = results[0]["id"].as_str().unwrap_or_default();
     assert_eq!(
         top_id, "beta-search",
-        "Repeated term should rank beta first"
+        "Query with a unique and shared term should rank beta first"
     );
 
     Ok(())

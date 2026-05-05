@@ -1118,7 +1118,7 @@ let user_name = "test";
         // Default profile should not trigger personalization
         let default_profile = StyleProfile::default();
         let personalizer = Personalizer::new(default_profile);
-        let skill = SkillRecord {
+        let skill = crate::storage::sqlite::SkillRecord {
             id: "test".to_string(),
             name: "Test Skill".to_string(),
             description: "A test".to_string(),
@@ -1138,6 +1138,7 @@ let user_name = "test";
             modified_at: "2025-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         };
         assert!(!personalizer.should_personalize(&skill));
 
