@@ -14,6 +14,31 @@ fn copy_cass_fixture(relative_path: &str, destination: &Path) -> std::io::Result
     std::fs::copy(&source, destination).map(|_| ())
 }
 
+fn copy_dir_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(destination)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_contents(&source_path, &destination_path)?;
+        } else {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Assertion Macros
 // =============================================================================
@@ -142,6 +167,8 @@ pub struct TestFixture {
     start_time: std::time::Instant,
     /// Test name for logging
     test_name: String,
+    /// Number of attempts for command retries on infra-style failures.
+    retry_attempts: u32,
 }
 
 #[allow(dead_code)]
@@ -177,6 +204,7 @@ impl TestFixture {
             db: None,
             start_time,
             test_name: test_name.to_string(),
+            retry_attempts: 1,
         }
     }
 
@@ -290,6 +318,135 @@ impl TestFixture {
         fixture
     }
 
+    fn clone_with_suffix(&self, suffix: &str) -> Self {
+        let mut clone = Self::new(&format!("{}-{suffix}", self.test_name));
+
+        copy_dir_contents(&self.skills_dir, &clone.skills_dir)
+            .expect("Failed to copy skills into cloned fixture");
+
+        let source_bundles = self.root.join("bundles");
+        let destination_bundles = clone.root.join("bundles");
+        copy_dir_contents(&source_bundles, &destination_bundles)
+            .expect("Failed to copy bundles into cloned fixture");
+
+        let source_mock_cass = self.root.join("mock_cass");
+        let destination_mock_cass = clone.root.join("mock_cass");
+        copy_dir_contents(&source_mock_cass, &destination_mock_cass)
+            .expect("Failed to copy mock CASS data into cloned fixture");
+
+        if self.config_path.exists() {
+            let init = clone.init();
+            assert!(init.success, "Failed to init cloned fixture: {}", init.stderr);
+
+            if self.db_path().exists() || self.index_path.exists() {
+                let index = clone.run_ms(&["--robot", "index"]);
+                assert!(
+                    index.success,
+                    "Failed to re-index cloned fixture: {}",
+                    index.stderr
+                );
+                clone.open_db();
+            }
+        }
+
+        clone.retry_attempts = self.retry_attempts;
+        clone
+    }
+
+    /// Rebuild this fixture into a fresh temp root with the same inputs and indexed state.
+    pub fn with_isolated_env(&self) -> Self {
+        self.clone_with_suffix("isolated")
+    }
+
+    /// Rebuild this fixture with a custom retry budget for command execution.
+    pub fn with_retry(&self, max_attempts: u32) -> Self {
+        let mut clone = self.clone_with_suffix("retry");
+        clone.retry_attempts = max_attempts.max(1);
+        clone
+    }
+
+    /// Verify temporary fixture cleanup by dropping a cloned isolated environment.
+    pub fn verify_cleanup(&self) -> anyhow::Result<()> {
+        let clone = self.with_isolated_env();
+        let clone_root = clone.root.clone();
+        drop(clone);
+
+        if clone_root.exists() {
+            return Err(anyhow::anyhow!(
+                "isolated fixture root still exists after drop: {}",
+                clone_root.display()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Count rows in common fixture tables for concise database assertions.
+    pub fn db_row_count(&self, table: &str) -> Option<i64> {
+        let sql = match table {
+            "skills" => "SELECT COUNT(*) FROM skills",
+            "skills_fts" => "SELECT COUNT(*) FROM skills_fts",
+            "skill_aliases" => "SELECT COUNT(*) FROM skill_aliases",
+            _ => return None,
+        };
+
+        self.db.as_ref().and_then(|db| {
+            db.query_row::<i64, _, _>(sql, [], |row| row.get(0)).ok()
+        })
+    }
+
+    /// Compare two test skills and summarize the meaningful differences.
+    pub fn diff_skills(&self, a: &TestSkill, b: &TestSkill) -> SkillDiff {
+        a.diff(b)
+    }
+
+    /// Build a ready Rust-oriented fixture with repo signals and indexed sample skills.
+    pub fn factory_rust_project() -> Self {
+        let fixture = Self::with_sample_skills("factory_rust_project");
+
+        std::fs::create_dir_all(fixture.root.join("src"))
+            .expect("Failed to create Rust src directory");
+        std::fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname = \"fixture-rust-project\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("Failed to write Cargo.toml");
+        std::fs::write(fixture.root.join("src/main.rs"), "fn main() {}\n")
+            .expect("Failed to write Rust main.rs");
+
+        fixture
+    }
+
+    /// Build a ready Node-oriented fixture with repo signals and indexed sample skills.
+    pub fn factory_node_project() -> Self {
+        let mut fixture = Self::new("factory_node_project");
+        let init = fixture.init();
+        assert!(init.success, "init failed: {}", init.stderr);
+
+        std::fs::create_dir_all(fixture.root.join("src"))
+            .expect("Failed to create Node src directory");
+        std::fs::write(
+            fixture.root.join("package.json"),
+            "{\n  \"name\": \"fixture-node-project\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\"\n}\n",
+        )
+        .expect("Failed to write package.json");
+        std::fs::write(
+            fixture.root.join("src/index.ts"),
+            "export function main(): void {\n  console.log('fixture-node-project');\n}\n",
+        )
+        .expect("Failed to write index.ts");
+
+        fixture.add_skill(&TestSkill::with_content(
+            "node-testing",
+            "# Node Testing\n\nUse a fast Node.js test runner and keep I/O isolated.\n",
+        ));
+        let index = fixture.run_ms(&["--robot", "index"]);
+        assert!(index.success, "Failed to index Node fixture: {}", index.stderr);
+        fixture.open_db();
+
+        fixture
+    }
+
     /// Add a skill to the test environment
     pub fn add_skill(&self, skill: &TestSkill) {
         let skill_dir = self.skills_dir.join(&skill.name);
@@ -312,6 +469,30 @@ impl TestFixture {
 
     /// Run ms CLI command with custom timeout
     pub fn run_ms_with_timeout(&self, args: &[&str], timeout: Duration) -> CommandOutput {
+        let attempts = self.retry_attempts.max(1);
+
+        for attempt in 1..=attempts {
+            let output = self.run_ms_once(args, timeout);
+            let retriable = !output.success
+                && output.exit_code == -1
+                && (output.stderr.contains("Command timed out")
+                    || output.stderr.contains("Failed to spawn")
+                    || output.stderr.contains("Error waiting"));
+
+            if !retriable || attempt == attempts {
+                return output;
+            }
+
+            println!(
+                "[RETRY] Attempt {attempt}/{attempts} failed with retriable infra error, retrying..."
+            );
+            std::thread::sleep(Duration::from_millis(100 * u64::from(attempt)));
+        }
+
+        unreachable!("run_ms_with_timeout should always return from the retry loop")
+    }
+
+    fn run_ms_once(&self, args: &[&str], timeout: Duration) -> CommandOutput {
         use std::io::Read;
         use std::process::Stdio;
 
@@ -635,6 +816,25 @@ pub struct TestSkill {
     pub layer: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDiff {
+    pub name_changed: bool,
+    pub content_changed: bool,
+    pub tags_added: Vec<String>,
+    pub tags_removed: Vec<String>,
+    pub layer_changed: bool,
+}
+
+impl SkillDiff {
+    pub fn has_changes(&self) -> bool {
+        self.name_changed
+            || self.content_changed
+            || self.layer_changed
+            || !self.tags_added.is_empty()
+            || !self.tags_removed.is_empty()
+    }
+}
+
 impl TestSkill {
     pub fn new(name: &str, description: &str) -> Self {
         let content = format!("# {name}\n\n{description}\n\n## Overview\n\n{description}\n");
@@ -692,6 +892,19 @@ impl TestSkill {
 
         md.push_str(&self.content);
         md
+    }
+
+    pub fn diff(&self, other: &Self) -> SkillDiff {
+        let self_tags: std::collections::BTreeSet<_> = self.tags.iter().cloned().collect();
+        let other_tags: std::collections::BTreeSet<_> = other.tags.iter().cloned().collect();
+
+        SkillDiff {
+            name_changed: self.name != other.name,
+            content_changed: self.content != other.content,
+            tags_added: other_tags.difference(&self_tags).cloned().collect(),
+            tags_removed: self_tags.difference(&other_tags).cloned().collect(),
+            layer_changed: self.layer != other.layer,
+        }
     }
 }
 
@@ -954,5 +1167,85 @@ impl CommandOutput {
 fn ensure_parent(path: &Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+}
+
+#[cfg(test)]
+mod enhancement_tests {
+    use super::{SkillDiff, TestFixture, TestSkill, sample_skills};
+
+    #[test]
+    fn test_with_isolated_env_preserves_indexed_state() {
+        let fixture = TestFixture::with_sample_skills("with_isolated_env_preserves_indexed_state");
+        let isolated = fixture.with_isolated_env();
+
+        assert_ne!(fixture.root, isolated.root);
+        assert!(isolated.config_path.exists());
+        assert_eq!(isolated.db_row_count("skills"), Some(3));
+        assert!(
+            isolated.skills_dir.join("rust-error-handling").join("SKILL.md").exists(),
+            "isolated fixture should copy project skills"
+        );
+    }
+
+    #[test]
+    fn test_with_retry_sets_retry_budget_on_isolated_clone() {
+        let fixture = TestFixture::with_sample_skills("with_retry_sets_retry_budget");
+        let retried = fixture.with_retry(3);
+
+        assert_ne!(fixture.root, retried.root);
+        assert_eq!(retried.retry_attempts, 3);
+        assert_eq!(retried.db_row_count("skills"), Some(3));
+    }
+
+    #[test]
+    fn test_verify_cleanup_drops_cloned_fixture_root() {
+        let fixture = TestFixture::with_sample_skills("verify_cleanup_drops_clone");
+        fixture.verify_cleanup().expect("cleanup verification");
+    }
+
+    #[test]
+    fn test_skill_diff_reports_content_tags_and_layer_changes() {
+        let base = sample_skills::rust_error_handling()
+            .with_tags(vec!["rust", "errors"])
+            .with_layer("project");
+        let updated = TestSkill::with_content(
+            "rust-error-handling",
+            "# Rust Error Handling\n\nUpdated guidance.\n",
+        )
+        .with_tags(vec!["rust", "advanced"])
+        .with_layer("global");
+
+        let diff = base.diff(&updated);
+
+        assert_eq!(
+            diff,
+            SkillDiff {
+                name_changed: false,
+                content_changed: true,
+                tags_added: vec!["advanced".to_string()],
+                tags_removed: vec!["errors".to_string()],
+                layer_changed: true,
+            }
+        );
+        assert!(diff.has_changes());
+    }
+
+    #[test]
+    fn test_factory_rust_project_creates_repo_signals() {
+        let fixture = TestFixture::factory_rust_project();
+
+        assert!(fixture.root.join("Cargo.toml").exists());
+        assert!(fixture.root.join("src/main.rs").exists());
+        assert_eq!(fixture.db_row_count("skills"), Some(3));
+    }
+
+    #[test]
+    fn test_factory_node_project_creates_repo_signals() {
+        let fixture = TestFixture::factory_node_project();
+
+        assert!(fixture.root.join("package.json").exists());
+        assert!(fixture.root.join("src/index.ts").exists());
+        assert_eq!(fixture.db_row_count("skills"), Some(1));
     }
 }
