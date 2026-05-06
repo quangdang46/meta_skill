@@ -18,6 +18,7 @@ pub struct AppContext {
     /// Deprecated: use output_format instead
     pub robot_mode: bool,
     pub output_format: OutputFormat,
+    pub quiet: bool,
     pub verbosity: u8,
 }
 
@@ -47,6 +48,7 @@ impl AppContext {
             }),
             robot_mode: cli.robot,
             output_format: cli.output_format(),
+            quiet: cli.quiet,
             verbosity: cli.verbose,
         })
     }

@@ -20,7 +20,7 @@ use clap::Args;
 use tracing::debug;
 
 use crate::app::AppContext;
-use crate::cli::output::OutputFormat;
+use crate::cli::output::{OutputFormat, emit_formatted};
 use crate::core::disclosure::sanitize_slug;
 use crate::error::Result;
 use crate::search::NegativeRouteKey;
@@ -273,76 +273,227 @@ pub(crate) fn route_task(
 }
 
 fn output_response(ctx: &AppContext, args: &RouteArgs, response: &RouteResponse) -> Result<()> {
+    if ctx.quiet {
+        return Ok(());
+    }
+
     let format = args.output.unwrap_or(ctx.output_format);
-    match format {
-        OutputFormat::Human => {
-            println!("Route: {}", response.task);
-            println!("Decision: {}", response.decision);
-            println!("Threshold: {:.2}", response.threshold);
-            println!();
+    emit_formatted(
+        response,
+        format,
+        format_route_human,
+        format_route_plain,
+        format_route_tsv,
+    )
+}
 
-            if response.candidates.is_empty() {
-                println!("No matching skills found.");
-                if let Some(ref fallback) = response.fallback {
-                    println!("Fallback: {}", fallback.search_command);
-                }
-            } else {
-                for (i, candidate) in response.candidates.iter().enumerate() {
-                    println!(
-                        "{}. {} (score: {:.2})",
-                        i + 1,
-                        candidate.display_id,
-                        candidate.score
-                    );
-                    for reason in &candidate.why {
-                        println!("   - {reason}");
-                    }
-                    println!("   load: {}", candidate.load_command);
-                    println!();
-                }
-            }
+fn format_route_human(response: &RouteResponse) -> String {
+    let mut lines = vec![
+        format!("Route: {}", response.task),
+        format!("Decision: {}", response.decision),
+        format!("Threshold: {:.2}", response.threshold),
+        String::new(),
+    ];
 
-            if args.debug && !response.debug_info.is_empty() {
-                println!("--- Debug Info ---");
-                for (i, debug) in response.debug_info.iter().enumerate() {
-                    println!("Candidate {}:", i + 1);
-                    println!("  Description score: {:.3}", debug.description_score);
-                    if !debug.trigger_matches.is_empty() {
-                        println!("  Trigger matches: {}", debug.trigger_matches.join(", "));
-                    }
-                    if !debug.tag_matches.is_empty() {
-                        println!("  Tag matches: {}", debug.tag_matches.join(", "));
-                    }
-                    if !debug.keyword_scores.is_empty() {
-                        println!("  Keyword scores:");
-                        for ks in &debug.keyword_scores {
-                            println!(
-                                "    - {keyword} ({score:.3})",
-                                keyword = ks.keyword,
-                                score = ks.score
-                            );
-                        }
-                    }
-                }
-            }
+    if response.candidates.is_empty() {
+        lines.push("No matching skills found.".to_string());
+        if let Some(fallback) = &response.fallback {
+            lines.push(format!("Fallback: {}", fallback.search_command));
         }
-        _ => {
-            let output = serde_json::to_value(response)?;
-            match format {
-                OutputFormat::Toon => {
-                    println!("{}", toon_rust::encode(output, None));
-                }
-                OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&output)?);
-                }
-                _ => {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        for (i, candidate) in response.candidates.iter().enumerate() {
+            lines.push(format!(
+                "{}. {} (score: {:.2})",
+                i + 1,
+                candidate.display_id,
+                candidate.score
+            ));
+            for reason in &candidate.why {
+                lines.push(format!("   - {reason}"));
+            }
+            lines.push(format!("   load: {}", candidate.load_command));
+            lines.push(String::new());
+        }
+    }
+
+    if !response.debug_info.is_empty() {
+        lines.push("--- Debug Info ---".to_string());
+        for (i, debug) in response.debug_info.iter().enumerate() {
+            lines.push(format!("Candidate {}:", i + 1));
+            lines.push(format!(
+                "  Description score: {:.3}",
+                debug.description_score
+            ));
+            if !debug.trigger_matches.is_empty() {
+                lines.push(format!(
+                    "  Trigger matches: {}",
+                    debug.trigger_matches.join(", ")
+                ));
+            }
+            if !debug.tag_matches.is_empty() {
+                lines.push(format!("  Tag matches: {}", debug.tag_matches.join(", ")));
+            }
+            if !debug.keyword_scores.is_empty() {
+                lines.push("  Keyword scores:".to_string());
+                for ks in &debug.keyword_scores {
+                    lines.push(format!("    - {} ({:.3})", ks.keyword, ks.score));
                 }
             }
         }
     }
 
-    Ok(())
+    lines.join("\n")
+}
+
+fn format_route_plain(response: &RouteResponse) -> String {
+    let mut lines = vec![
+        format!("task={}", response.task),
+        format!("decision={}", response.decision),
+        format!("threshold={:.2}", response.threshold),
+        format!("candidate_count={}", response.candidates.len()),
+    ];
+
+    for (i, candidate) in response.candidates.iter().enumerate() {
+        let rank = i + 1;
+        lines.push(format!("candidate.{rank}.skill_id={}", candidate.skill_id));
+        lines.push(format!(
+            "candidate.{rank}.display_id={}",
+            candidate.display_id
+        ));
+        lines.push(format!("candidate.{rank}.score={:.6}", candidate.score));
+        lines.push(format!(
+            "candidate.{rank}.default_load={}",
+            candidate.default_load
+        ));
+        lines.push(format!(
+            "candidate.{rank}.entry_sections={}",
+            candidate.entry_sections.join(",")
+        ));
+        lines.push(format!(
+            "candidate.{rank}.load_command={}",
+            candidate.load_command
+        ));
+        lines.push(format!("candidate.{rank}.why={}", candidate.why.join(",")));
+        lines.push(format!(
+            "candidate.{rank}.when_to_use={}",
+            candidate.when_to_use.as_deref().unwrap_or("")
+        ));
+        lines.push(format!(
+            "candidate.{rank}.execution_mode={}",
+            candidate.execution_mode.as_deref().unwrap_or("")
+        ));
+    }
+
+    if let Some(fallback) = &response.fallback {
+        lines.push(format!(
+            "fallback.search_command={}",
+            fallback.search_command
+        ));
+        if let Some(suggest) = &fallback.suggest_command {
+            lines.push(format!("fallback.suggest_command={suggest}"));
+        }
+    }
+
+    if !response.debug_info.is_empty() {
+        for (i, debug) in response.debug_info.iter().enumerate() {
+            let rank = i + 1;
+            lines.push(format!(
+                "debug.{rank}.description_score={:.6}",
+                debug.description_score
+            ));
+            lines.push(format!(
+                "debug.{rank}.trigger_matches={}",
+                debug.trigger_matches.join(",")
+            ));
+            lines.push(format!(
+                "debug.{rank}.tag_matches={}",
+                debug.tag_matches.join(",")
+            ));
+            let keyword_scores = debug
+                .keyword_scores
+                .iter()
+                .map(|ks| format!("{}:{:.3}", ks.keyword, ks.score))
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("debug.{rank}.keyword_scores={keyword_scores}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_route_tsv(response: &RouteResponse) -> String {
+    let mut rows = vec![
+        [
+            "decision",
+            "threshold",
+            "rank",
+            "skill_id",
+            "display_id",
+            "score",
+            "default_load",
+            "entry_sections",
+            "load_command",
+            "why",
+            "when_to_use",
+            "execution_mode",
+            "fallback_search_command",
+        ]
+        .join("\t"),
+    ];
+
+    if response.candidates.is_empty() {
+        rows.push(
+            [
+                response.decision.clone(),
+                format!("{:.2}", response.threshold),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                response
+                    .fallback
+                    .as_ref()
+                    .map(|fallback| fallback.search_command.clone())
+                    .unwrap_or_default(),
+            ]
+            .join("\t"),
+        );
+        return rows.join("\n");
+    }
+
+    for (i, candidate) in response.candidates.iter().enumerate() {
+        rows.push(
+            [
+                response.decision.clone(),
+                format!("{:.2}", response.threshold),
+                (i + 1).to_string(),
+                tsv_sanitize(&candidate.skill_id),
+                tsv_sanitize(&candidate.display_id),
+                format!("{:.6}", candidate.score),
+                tsv_sanitize(&candidate.default_load),
+                tsv_sanitize(&candidate.entry_sections.join(",")),
+                tsv_sanitize(&candidate.load_command),
+                tsv_sanitize(&candidate.why.join(",")),
+                tsv_sanitize(candidate.when_to_use.as_deref().unwrap_or("")),
+                tsv_sanitize(candidate.execution_mode.as_deref().unwrap_or("")),
+                String::new(),
+            ]
+            .join("\t"),
+        );
+    }
+
+    rows.join("\n")
+}
+
+fn tsv_sanitize(value: &str) -> String {
+    value.replace('\t', " ").replace('\n', " ")
 }
 
 // =============================================================================
@@ -834,6 +985,59 @@ mod tests {
 
         assert_eq!(response.decision, "no_match");
         assert!(response.fallback.is_some());
+    }
+
+    #[test]
+    fn test_route_plain_output_format() {
+        let response = RouteResponse {
+            route_schema_version: 1,
+            task: "fix rust error".to_string(),
+            threshold: 0.65,
+            decision: "match".to_string(),
+            candidates: vec![RouteCandidate {
+                skill_id: "claude/rust-error-handling".to_string(),
+                display_id: "rust-error-handling".to_string(),
+                score: 0.93,
+                why: vec!["keyword:rust".to_string(), "keyword:error".to_string()],
+                when_to_use: Some("Compiler errors".to_string()),
+                default_load: "section:checklist".to_string(),
+                entry_sections: vec!["checklist".to_string()],
+                load_command: "ms load claude/rust-error-handling --section checklist -O json"
+                    .to_string(),
+                execution_mode: Some("inline".to_string()),
+            }],
+            debug_info: vec![],
+            fallback: None,
+        };
+
+        let plain = format_route_plain(&response);
+        assert!(plain.contains("task=fix rust error"));
+        assert!(plain.contains("candidate.1.skill_id=claude/rust-error-handling"));
+        assert!(plain.contains("candidate.1.load_command=ms load claude/rust-error-handling"));
+        assert!(!plain.contains("{\n"));
+    }
+
+    #[test]
+    fn test_route_tsv_output_format() {
+        let response = RouteResponse {
+            route_schema_version: 1,
+            task: "unknown thing".to_string(),
+            threshold: 0.65,
+            decision: "no_match".to_string(),
+            candidates: vec![],
+            debug_info: vec![],
+            fallback: Some(RouteFallback {
+                search_command: "ms search \"unknown thing\" -O json".to_string(),
+                suggest_command: None,
+            }),
+        };
+
+        let tsv = format_route_tsv(&response);
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("decision\tthreshold\trank\tskill_id"));
+        assert!(lines[1].contains("no_match\t0.65"));
+        assert!(lines[1].contains("ms search \"unknown thing\" -O json"));
     }
 
     #[test]
