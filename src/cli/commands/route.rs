@@ -377,6 +377,15 @@ fn score_skill(
         .get("when_to_use")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let route_keywords: Vec<String> = meta
+        .get("keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let entry_sections: Vec<String> = meta
         .get("entry_sections")
         .and_then(|v| v.as_array())
@@ -439,6 +448,14 @@ fn score_skill(
             if tags.iter().any(|t: &&str| t.contains(word)) {
                 score += 0.4;
             }
+            if route_keywords.iter().any(|keyword| {
+                keyword
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .any(|part| part == word)
+            }) {
+                score += 0.7;
+            }
             // Check context project types
             let project_types: Vec<&str> = meta
                 .get("context")
@@ -467,6 +484,15 @@ fn score_skill(
         keyword_scores.iter().map(|ks| ks.score).sum::<f64>()
             / (keyword_scores.len() as f64).max(1.0)
     };
+    let route_keyword_score = route_keywords
+        .iter()
+        .map(|keyword| score_route_keyword_hint(&task_normalized, &task_words, keyword))
+        .fold(0.0, f64::max);
+    let when_to_use_score = when_to_use
+        .as_deref()
+        .map(|text| score_route_keyword_hint(&task_normalized, &task_words, text))
+        .unwrap_or(0.0);
+    let route_metadata_score = route_keyword_score.max(when_to_use_score);
 
     // 3. Tag matching
     let tags: Vec<String> = meta
@@ -505,12 +531,17 @@ fn score_skill(
 
     // Composite score: weighted average
     let composite = trigger_score * 0.35 // trigger phrases are strongest signal
-        + keyword_score * 0.30            // keyword matches in name/description/tags
-        + tag_score * 0.15                // tag relevance
-        + description_score * 0.20; // description overlap
+        + route_metadata_score * 0.25    // compact route metadata from import/index
+        + keyword_score * 0.20           // keyword matches in name/description/tags/metadata
+        + tag_score * 0.10               // tag relevance
+        + description_score * 0.10; // description overlap
     let composite = if trigger_score >= 1.0 {
         composite.max(0.85)
     } else if trigger_score >= 0.9 {
+        composite.max(0.7)
+    } else if route_metadata_score >= 0.95 && keyword_score >= 0.6 {
+        // Imported compact route metadata should be authoritative enough to
+        // clear the default threshold when it fully covers the task.
         composite.max(0.7)
     } else {
         composite
@@ -640,6 +671,41 @@ fn score_trigger_phrase(task_normalized: &str, phrase: &str) -> f64 {
     }
 
     0.0
+}
+
+fn score_route_keyword_hint(task_normalized: &str, task_words: &[&str], hint: &str) -> f64 {
+    let hint_normalized = normalize_route_text(hint);
+    if hint_normalized.is_empty() {
+        return 0.0;
+    }
+
+    if task_normalized == hint_normalized {
+        return 1.0;
+    }
+
+    if task_normalized.contains(&hint_normalized) || hint_normalized.contains(task_normalized) {
+        return 0.95;
+    }
+
+    let hint_words: Vec<&str> = hint_normalized
+        .split_whitespace()
+        .filter(|word| !word.is_empty() && word.len() > 2)
+        .collect();
+    if hint_words.is_empty() || task_words.is_empty() {
+        return 0.0;
+    }
+
+    let overlap = task_words
+        .iter()
+        .filter(|word| hint_words.contains(word))
+        .count();
+    if overlap == 0 {
+        return 0.0;
+    }
+
+    let task_coverage = overlap as f64 / task_words.len() as f64;
+    let hint_density = overlap as f64 / hint_words.len() as f64;
+    (task_coverage * 0.8 + hint_density * 0.2).min(1.0)
 }
 
 fn derive_entry_sections_from_body(body: &str) -> Vec<String> {
@@ -968,6 +1034,35 @@ mod tests {
             score_trigger_phrase("archive fallback only", "provider route verification"),
             0.0
         );
+    }
+
+    #[test]
+    fn test_compact_route_keywords_can_meet_default_threshold() {
+        let skill = SkillRecord {
+            metadata_json: serde_json::json!({
+                "provider": "codex",
+                "canonical_id": "codex/rust-async-errors",
+                "display_id": "rust-async-errors",
+                "keywords": [
+                    "fix rust async borrow checker send sync and lifetime errors with minimal changes",
+                    "rust async errors"
+                ],
+                "tags": ["rust", "async", "debugging"],
+                "execution_mode": "inline"
+            })
+            .to_string(),
+            ..make_skill_record(
+                "codex/rust-async-errors",
+                "Rust Async Error Triage",
+                "Fix Rust async borrow checker, Send/Sync, and lifetime errors with minimal changes.",
+                vec!["rust", "async", "debugging"],
+            )
+        };
+
+        let response = route_task(vec![skill], "rust async errors", 3, 0.65, false);
+        assert_eq!(response.decision, "match");
+        assert_eq!(response.candidates[0].skill_id, "codex/rust-async-errors");
+        assert!(response.candidates[0].score >= 0.65);
     }
     // ===================== bd-64zk: ms route CLI acceptance tests =====================
 

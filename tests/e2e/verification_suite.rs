@@ -748,6 +748,54 @@ Global helper content.
     Ok(())
 }
 
+/// bd-1p6y unit 12: compact route keywords imported from provider metadata meet the default threshold
+#[test]
+fn test_provider_compact_route_keywords_match_default_threshold() -> Result<()> {
+    let mut fixture = E2EFixture::new("provider_compact_route_keywords");
+    let codex_root = fixture.root.join(".codex/skills");
+
+    create_provider_skill(
+        &codex_root.join("rust-async-errors"),
+        r#"---
+id: rust-async-errors
+name: Rust Async Error Triage
+description: Fix Rust async borrow checker, Send/Sync, and lifetime errors with minimal changes.
+tags: [rust, async, debugging]
+---
+# Rust Async Error Triage
+
+## Overview
+Use this skill when Rust async code fails with borrow checker, Send/Sync, or lifetime errors.
+"#,
+        &[],
+        &[],
+    )?;
+
+    let init_out = fixture.run_ms(&["--robot", "init"]);
+    fixture.assert_success(&init_out, "init");
+
+    let route_out = fixture.run_ms(&["--robot", "route", "rust async errors"]);
+    fixture.assert_success(&route_out, "route_rust_async_errors");
+    let route_json = route_out.json();
+    assert_eq!(route_json["decision"], "match");
+
+    let candidate = &route_json["candidates"][0];
+    assert_eq!(candidate["skill_id"], "codex/rust-async-errors");
+    assert!(
+        candidate["score"].as_f64().unwrap_or(0.0) >= 0.65,
+        "expected compact route metadata to clear the default threshold: {route_json}"
+    );
+    assert!(
+        candidate["load_command"]
+            .as_str()
+            .expect("load command")
+            .contains("codex/rust-async-errors"),
+        "load command should use the canonical provider-qualified id"
+    );
+
+    Ok(())
+}
+
 /// bd-1p6y unit 12: providers sync imports discovered provider roots and invalidates no_match cache
 #[test]
 fn test_provider_sync_apply_imports_new_skill_and_invalidates_route_cache() -> Result<()> {
