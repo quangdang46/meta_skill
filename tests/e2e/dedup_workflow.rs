@@ -77,6 +77,7 @@ fn setup_dedup_fixture(scenario: &str) -> Result<E2EFixture> {
     fixture.log_step("Index skills");
     let output = fixture.run_ms(&["--robot", "index"]);
     fixture.assert_success(&output, "index");
+    fixture.open_db();
 
     // Checkpoint: skills indexed
     fixture.checkpoint("dedup:indexed");
@@ -92,6 +93,45 @@ fn setup_dedup_fixture(scenario: &str) -> Result<E2EFixture> {
     );
 
     Ok(fixture)
+}
+
+#[test]
+fn test_dedup_scan_is_non_mutating() -> Result<()> {
+    let mut fixture = setup_dedup_fixture("dedup_scan_non_mutating")?;
+
+    fixture.log_step("Run dedup scan as non-mutating dry-run");
+    let output = fixture.run_ms(&["--robot", "dedup", "scan", "--threshold", "0.5"]);
+    fixture.assert_success(&output, "dedup scan dry-run");
+
+    let json = output.json();
+    assert_eq!(json["status"].as_str(), Some("ok"));
+    assert!(
+        json["total_pairs"].as_u64().unwrap_or(0) >= 1,
+        "Expected scan to find at least one duplicate pair"
+    );
+
+    fixture.verify_db_state(
+        |db| {
+            let alias_count = db
+                .query_row("SELECT COUNT(*) FROM skill_aliases", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .ok();
+            let deprecated_count = db
+                .query_row(
+                    "SELECT COUNT(*) FROM skills WHERE is_deprecated = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+
+            alias_count == Some(0) && deprecated_count == Some(0)
+        },
+        "dedup scan should not create aliases or deprecate skills",
+    );
+
+    fixture.generate_report();
+    Ok(())
 }
 
 #[test]
@@ -284,6 +324,117 @@ fn test_dedup_alias() -> Result<()> {
             "canonical": "rust-error-handling",
             "alias": "rust-errors",
         })),
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_dedup_merge_marks_secondary_deprecated() -> Result<()> {
+    let mut fixture = setup_dedup_fixture("dedup_merge_marks_secondary")?;
+    let reason = "Merged in dedup workflow test";
+
+    fixture.checkpoint("dedup:pre-merge");
+
+    fixture.log_step("Merge duplicate skills");
+    let output = fixture.run_ms(&[
+        "--robot",
+        "dedup",
+        "merge",
+        "rust-error-handling",
+        "rust-error-patterns",
+        "--reason",
+        reason,
+    ]);
+    fixture.assert_success(&output, "dedup merge");
+
+    fixture.checkpoint("dedup:post-merge");
+
+    let json = output.json();
+    assert_eq!(json["status"].as_str(), Some("ok"));
+    assert_eq!(json["action"].as_str(), Some("merge"));
+    assert_eq!(json["primary"]["id"].as_str(), Some("rust-error-handling"));
+    assert_eq!(json["secondary"]["id"].as_str(), Some("rust-error-patterns"));
+    assert_eq!(json["secondary"]["deprecated"].as_bool(), Some(true));
+    assert_eq!(json["secondary"]["reason"].as_str(), Some(reason));
+
+    fixture.verify_db_state(
+        |db| {
+            let deprecated = db
+                .query_row(
+                    "SELECT is_deprecated FROM skills WHERE id = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+            let deprecation_reason = db
+                .query_row(
+                    "SELECT deprecation_reason FROM skills WHERE id = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            let alias_target = db
+                .query_row(
+                    "SELECT skill_id FROM skill_aliases WHERE alias = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            let alias_type = db
+                .query_row(
+                    "SELECT alias_type FROM skill_aliases WHERE alias = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+
+            deprecated == Some(1)
+                && deprecation_reason.as_deref() == Some(reason)
+                && alias_target.as_deref() == Some("rust-error-handling")
+                && alias_type.as_deref() == Some("deprecated")
+        },
+        "merge should deprecate the secondary skill and add a deprecated alias",
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_dedup_merge_preserves_primary_content() -> Result<()> {
+    let mut fixture = setup_dedup_fixture("dedup_merge_preserves_primary")?;
+
+    fixture.log_step("Merge duplicate skills");
+    let output = fixture.run_ms(&[
+        "--robot",
+        "dedup",
+        "merge",
+        "rust-error-handling",
+        "rust-error-patterns",
+    ]);
+    fixture.assert_success(&output, "dedup merge");
+
+    fixture.log_step("Show primary skill after merge");
+    let output = fixture.run_ms(&["--robot", "show", "rust-error-handling"]);
+    fixture.assert_success(&output, "show primary after merge");
+    let primary = &output.json()["skill"];
+    assert_eq!(
+        primary["description"].as_str(),
+        Some("Best practices for error handling in Rust"),
+        "Primary skill description should remain unchanged after merge"
+    );
+
+    fixture.log_step("Load deprecated secondary through alias resolution");
+    let output = fixture.run_ms(&["--robot", "load", "rust-error-patterns", "--full"]);
+    fixture.assert_success(&output, "load merged alias");
+    let frontmatter = &output.json()["data"]["frontmatter"];
+    assert_eq!(
+        frontmatter["description"].as_str(),
+        Some("Best practices for error handling in Rust"),
+        "Merged alias should resolve to the canonical skill content"
     );
 
     fixture.generate_report();
