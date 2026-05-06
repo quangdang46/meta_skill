@@ -13,9 +13,23 @@ use ms::cli::{Cli, Commands};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    apply_process_output_overrides(&cli);
     init_tracing(&cli);
 
-    match run(&cli) {
+    let stdout_guard = cli.quiet.then(|| gag::Gag::stdout()).transpose();
+    let result = match stdout_guard {
+        Ok(guard) => {
+            let result = run(&cli);
+            drop(guard);
+            result
+        }
+        Err(err) => {
+            eprintln!("Error: failed to apply --quiet stdout suppression: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if cli.robot {
@@ -36,6 +50,22 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn apply_process_output_overrides(cli: &Cli) {
+    match cli.color {
+        Some(ms::cli::ColorMode::Always) => {
+            console::set_colors_enabled(true);
+            console::set_colors_enabled_stderr(true);
+            colored::control::set_override(true);
+        }
+        Some(ms::cli::ColorMode::Never) => {
+            console::set_colors_enabled(false);
+            console::set_colors_enabled_stderr(false);
+            colored::control::set_override(false);
+        }
+        Some(ms::cli::ColorMode::Auto) | None => {}
     }
 }
 

@@ -29,7 +29,8 @@ impl AppContext {
             .config
             .clone()
             .unwrap_or_else(|| default_config_path(&ms_root));
-        let config = Config::load(cli.config.as_deref(), &ms_root)?;
+        let mut config = Config::load(cli.config.as_deref(), &ms_root)?;
+        apply_cli_output_overrides(&mut config, cli);
 
         Ok(Self {
             ms_root: ms_root.clone(),
@@ -68,6 +69,16 @@ impl AppContext {
     }
 }
 
+fn apply_cli_output_overrides(config: &mut Config, cli: &crate::cli::Cli) {
+    if let Some(theme) = &cli.theme {
+        config.output.theme = theme.clone();
+    }
+
+    config.output.plain = cli.force_plain();
+    config.output.force_rich = cli.force_rich();
+    config.output.no_unicode = cli.plain;
+}
+
 fn default_config_path(ms_root: &Path) -> PathBuf {
     if ms_root.ends_with(".ms") {
         ms_root.join("config.toml")
@@ -88,4 +99,47 @@ fn find_upwards(start: &Path, name: &str) -> Result<Option<PathBuf>> {
         current = dir.parent();
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::apply_cli_output_overrides;
+    use crate::cli::Cli;
+    use crate::config::Config;
+
+    #[test]
+    fn cli_theme_overrides_output_config() {
+        let cli = Cli::parse_from(["ms", "--theme", "minimal", "config"]);
+        let mut config = Config::default();
+
+        apply_cli_output_overrides(&mut config, &cli);
+
+        assert_eq!(config.output.theme, "minimal");
+    }
+
+    #[test]
+    fn cli_color_overrides_output_mode() {
+        let cli = Cli::parse_from(["ms", "--color", "always", "config"]);
+        let mut config = Config::default();
+
+        apply_cli_output_overrides(&mut config, &cli);
+
+        assert!(config.output.force_rich);
+        assert!(!config.output.plain);
+        assert!(!config.output.no_unicode);
+    }
+
+    #[test]
+    fn cli_plain_overrides_output_mode() {
+        let cli = Cli::parse_from(["ms", "--plain", "config"]);
+        let mut config = Config::default();
+
+        apply_cli_output_overrides(&mut config, &cli);
+
+        assert!(config.output.plain);
+        assert!(config.output.no_unicode);
+        assert!(!config.output.force_rich);
+    }
 }

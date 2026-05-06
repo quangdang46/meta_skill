@@ -65,6 +65,7 @@ colored = "3.0.0"
 indicatif = "0.18.3"
 console = "0.16.3"
 rich_rust = { version = "0.2.0", features = ["full"] }
+gag = "1.0.0"
 
 # TUI
 ratatui = "0.30.0"
