@@ -6,8 +6,12 @@
 //! - Prune with filters (older-than, stats)
 //! - Prune analyze and proposals
 
+use std::fs;
+use std::process::Command;
+
 use super::fixture::E2EFixture;
 use ms::error::Result;
+use ms::storage::TombstoneManager;
 
 // Test skill definitions
 
@@ -43,6 +47,27 @@ Check errors explicitly after each function call.
 - Use sentinel errors sparingly
 "#;
 
+const SKILL_RUST_PATTERNS: &str = r#"---
+name: Rust Error Patterns
+description: Error handling patterns and best practices in Rust
+tags: [rust, errors, patterns, advanced]
+---
+
+# Rust Error Patterns
+
+Use `Result<T, E>` and propagate errors with the `?` operator.
+
+## Guidelines
+
+- Prefer thiserror for library error types
+- Prefer anyhow for application error types
+- Always add context when propagating errors
+
+## Comparison
+
+- Compare anyhow versus thiserror tradeoffs
+"#;
+
 const SKILL_PYTHON_TESTING: &str = r#"---
 name: Python Testing
 description: Testing strategies for Python projects
@@ -75,11 +100,58 @@ fn setup_prune_fixture(scenario: &str) -> Result<E2EFixture> {
     fixture.log_step("Index skills");
     let output = fixture.run_ms(&["--robot", "index"]);
     fixture.assert_success(&output, "index");
+    fixture.open_db();
 
     // Checkpoint: skills indexed
     fixture.checkpoint("prune:indexed");
 
     Ok(fixture)
+}
+
+fn setup_prune_merge_fixture(scenario: &str) -> Result<E2EFixture> {
+    let mut fixture = E2EFixture::new(scenario);
+
+    fixture.log_step("Initialize ms");
+    let output = fixture.init();
+    fixture.assert_success(&output, "init");
+
+    fixture.log_step("Create merge/deprecate fixture skills");
+    fixture.create_skill("rust-error-handling", SKILL_RUST_ERRORS)?;
+    fixture.create_skill("rust-error-patterns", SKILL_RUST_PATTERNS)?;
+    fixture.create_skill("python-testing", SKILL_PYTHON_TESTING)?;
+
+    fixture.log_step("Index skills");
+    let output = fixture.run_ms(&["--robot", "index"]);
+    fixture.assert_success(&output, "index");
+    fixture.open_db();
+    fixture.checkpoint("prune-merge:indexed");
+
+    Ok(fixture)
+}
+
+fn init_beads_workspace(fixture: &E2EFixture) {
+    let output = Command::new("br")
+        .args(["init", "--json"])
+        .current_dir(&fixture.root)
+        .output()
+        .expect("failed to run br init for prune workflow");
+    assert!(
+        output.status.success(),
+        "br init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_tombstone(fixture: &E2EFixture, relative_path: &str) -> Result<String> {
+    let full_path = fixture.ms_root.join(relative_path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&full_path, "temporary tombstone content for prune e2e")?;
+
+    let manager = TombstoneManager::new(&fixture.ms_root);
+    let record = manager.tombstone(&full_path, Some("prune e2e"), Some("e2e"))?;
+    Ok(record.id)
 }
 
 #[test]
@@ -476,6 +548,81 @@ fn test_prune_proposals_dry_run() -> Result<()> {
 }
 
 #[test]
+fn test_prune_proposals_emit_beads() -> Result<()> {
+    let mut fixture = setup_prune_fixture("prune_proposals_emit_beads")?;
+    init_beads_workspace(&fixture);
+
+    fixture.log_step("Generate prune proposals and emit beads");
+    let output = fixture.run_ms(&["--robot", "prune", "proposals", "--emit-beads"]);
+    fixture.assert_success(&output, "prune proposals emit beads");
+
+    let json = output.json();
+    let created = json["beads"]["created"]
+        .as_array()
+        .expect("beads.created array");
+
+    assert_eq!(json["status"].as_str(), Some("proposals_ready"));
+    assert_eq!(json["beads"]["emitted"].as_bool(), Some(true));
+    assert!(
+        !created.is_empty(),
+        "Expected prune proposals to emit at least one bead"
+    );
+
+    let br_output = Command::new("br")
+        .args(["list", "--json"])
+        .current_dir(&fixture.root)
+        .output()
+        .expect("failed to run br list after prune proposal emission");
+    assert!(
+        br_output.status.success(),
+        "br list failed: {}",
+        String::from_utf8_lossy(&br_output.stderr)
+    );
+
+    let created_beads: serde_json::Value =
+        serde_json::from_slice(&br_output.stdout).expect("valid br list json");
+    let created_beads = created_beads.as_array().expect("br list array");
+
+    assert_eq!(
+        created_beads.len(),
+        created.len(),
+        "br workspace should contain the emitted prune proposal beads"
+    );
+    assert!(
+        created_beads.iter().all(|issue| issue["title"]
+            .as_str()
+            .map(|title| title.contains("ms-prune-"))
+            .unwrap_or(false)),
+        "All emitted bead titles should use the ms-prune prefix"
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_prune_review_no_prompt() -> Result<()> {
+    let mut fixture = setup_prune_fixture("prune_review_no_prompt")?;
+
+    fixture.log_step("Review prune proposals without interactive prompts");
+    let output = fixture.run_ms(&["--robot", "prune", "review", "--no-prompt"]);
+    fixture.assert_success(&output, "prune review no-prompt");
+
+    let json = output.json();
+    assert_eq!(json["status"].as_str(), Some("proposals_ready"));
+    assert!(
+        json["proposals"]["deprecate"]
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false),
+        "Review without prompts should surface deprecate proposals"
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
 fn test_prune_restore_nonexistent() -> Result<()> {
     let mut fixture = setup_prune_fixture("prune_restore_nonexistent")?;
 
@@ -511,18 +658,10 @@ fn test_prune_apply_requires_approval() -> Result<()> {
     let mut fixture = setup_prune_fixture("prune_apply_no_approval")?;
 
     fixture.log_step("Attempt apply without --approve flag");
-    let output = fixture.run_ms(&[
-        "--robot",
-        "prune",
-        "apply",
-        "deprecate:rust-error-handling",
-    ]);
+    let output = fixture.run_ms(&["--robot", "prune", "apply", "deprecate:rust-error-handling"]);
 
     // Should fail because --approve is required
-    assert!(
-        !output.success,
-        "Apply without --approve should fail"
-    );
+    assert!(!output.success, "Apply without --approve should fail");
 
     let combined = format!("{}{}", output.stdout, output.stderr);
     assert!(
@@ -592,6 +731,129 @@ fn test_prune_apply_dry_run() -> Result<()> {
         skill_ids.contains(&"rust-error-handling"),
         "Skill should still be listed after dry-run"
     );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_prune_apply_merge() -> Result<()> {
+    let mut fixture = setup_prune_merge_fixture("prune_apply_merge")?;
+
+    fixture.log_step("Apply explicit merge proposal");
+    let output = fixture.run_ms(&[
+        "--robot",
+        "prune",
+        "apply",
+        "merge:rust-error-handling,rust-error-patterns",
+        "--approve",
+        "--target",
+        "rust-error-handling",
+    ]);
+    fixture.assert_success(&output, "prune apply merge");
+
+    let json = output.json();
+    let draft_path = json["drafts"][0].as_str().expect("merge draft path");
+
+    assert_eq!(json["status"].as_str(), Some("ok"));
+    assert_eq!(json["action"].as_str(), Some("merge"));
+    assert_eq!(json["dry_run"].as_bool(), Some(false));
+    assert!(
+        fs::metadata(draft_path).is_ok(),
+        "Merge draft should exist at {}",
+        draft_path
+    );
+
+    let draft = fs::read_to_string(draft_path)?;
+    assert!(
+        draft.contains("## Comparison"),
+        "Merged draft should include the secondary skill section"
+    );
+    assert!(
+        draft.contains("- patterns"),
+        "Merged draft should preserve tags from the secondary skill"
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_prune_apply_deprecate() -> Result<()> {
+    let mut fixture = setup_prune_merge_fixture("prune_apply_deprecate")?;
+
+    fixture.log_step("Apply explicit deprecate proposal with replacement");
+    let output = fixture.run_ms(&[
+        "--robot",
+        "prune",
+        "apply",
+        "deprecate:rust-error-patterns",
+        "--approve",
+        "--replacement",
+        "rust-error-handling",
+    ]);
+    fixture.assert_success(&output, "prune apply deprecate");
+
+    let json = output.json();
+    assert_eq!(json["status"].as_str(), Some("ok"));
+    assert_eq!(json["action"].as_str(), Some("deprecate"));
+    assert_eq!(json["dry_run"].as_bool(), Some(false));
+
+    fixture.verify_db_state(
+        |db| {
+            let deprecated = db
+                .query_row(
+                    "SELECT is_deprecated FROM skills WHERE id = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+            let alias_target = db
+                .query_row(
+                    "SELECT skill_id FROM skill_aliases WHERE alias = ?1",
+                    ["rust-error-patterns"],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+
+            deprecated == Some(1) && alias_target.as_deref() == Some("rust-error-handling")
+        },
+        "deprecate apply should mark the skill deprecated and create an alias",
+    );
+
+    fixture.log_step("Resolve deprecated skill through load");
+    let output = fixture.run_ms(&["--robot", "load", "rust-error-patterns", "--full"]);
+    fixture.assert_success(&output, "load deprecated alias after prune apply");
+
+    assert_eq!(
+        output.json()["data"]["frontmatter"]["id"].as_str(),
+        Some("rust-error-handling")
+    );
+
+    fixture.generate_report();
+    Ok(())
+}
+
+#[test]
+fn test_prune_purge() -> Result<()> {
+    let mut fixture = setup_prune_fixture("prune_purge")?;
+    let tombstone_id = create_tombstone(&fixture, "scratch/prune-me.txt")?;
+
+    fixture.log_step("Purge a real tombstone with approval");
+    let output = fixture.run_ms(&["--robot", "prune", "purge", &tombstone_id, "--approve"]);
+    fixture.assert_success(&output, "prune purge");
+
+    let json = output.json();
+    assert_eq!(json["count"].as_u64(), Some(1));
+    assert!(
+        json["bytes_freed"].as_u64().unwrap_or(0) > 0,
+        "Purging a real tombstone should free bytes"
+    );
+
+    fixture.log_step("Verify tombstone is gone after purge");
+    let output = fixture.run_ms(&["--robot", "prune", "list"]);
+    fixture.assert_success(&output, "prune list after purge");
+    assert_eq!(output.json()["count"].as_u64(), Some(0));
 
     fixture.generate_report();
     Ok(())

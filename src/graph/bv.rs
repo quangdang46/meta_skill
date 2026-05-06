@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
-use crate::beads::Issue;
+use crate::beads::{DependencyType, Issue};
 use crate::error::{MsError, Result};
 
 /// Client for interacting with the bv CLI in robot mode.
@@ -98,12 +99,52 @@ pub fn write_beads_jsonl(issues: &[Issue], root: &Path) -> Result<PathBuf> {
     let jsonl_path = beads_dir.join("beads.jsonl");
     let mut lines = Vec::with_capacity(issues.len());
     for issue in issues {
-        let line = serde_json::to_string(issue)?;
+        let line = serde_json::to_string(&issue_to_bv_json(issue)?)?;
         lines.push(line);
     }
     std::fs::write(&jsonl_path, lines.join("\n"))
         .map_err(|err| MsError::Config(format!("write {}: {err}", jsonl_path.display())))?;
     Ok(jsonl_path)
+}
+
+fn issue_to_bv_json(issue: &Issue) -> Result<Value> {
+    let mut value = serde_json::to_value(issue)?;
+    let Some(obj) = value.as_object_mut() else {
+        return Err(MsError::Config(
+            "failed to serialize issue for bv export".to_string(),
+        ));
+    };
+
+    let dependencies = issue
+        .dependencies
+        .iter()
+        .map(|dependency| dependency_to_bv_json(&issue.id, dependency))
+        .collect::<Vec<_>>();
+    if dependencies.is_empty() {
+        obj.remove("dependencies");
+    } else {
+        obj.insert("dependencies".to_string(), Value::Array(dependencies));
+    }
+
+    Ok(value)
+}
+
+fn dependency_to_bv_json(issue_id: &str, dependency: &crate::beads::Dependency) -> Value {
+    let dependency_type = dependency.dependency_type.unwrap_or(DependencyType::Blocks);
+    let dependency_type = serde_json::to_value(dependency_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "blocks".to_string());
+
+    json!({
+        "id": dependency.id,
+        "title": dependency.title,
+        "status": dependency.status,
+        "dependency_type": dependency.dependency_type,
+        "issue_id": issue_id,
+        "depends_on_id": dependency.id,
+        "type": dependency_type,
+    })
 }
 
 /// Helper to run bv on a temporary beads JSONL generated from the provided issues.
@@ -317,6 +358,28 @@ mod tests {
 
         assert_eq!(parsed.dependencies.len(), 1);
         assert_eq!(parsed.dependencies[0].id, "dep-1");
+    }
+
+    #[test]
+    fn test_write_beads_jsonl_adds_bv_dependency_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut issue = sample_issue("with-deps");
+        issue.dependencies = vec![crate::beads::Dependency {
+            id: "dep-1".to_string(),
+            title: "Dependency 1".to_string(),
+            status: Some(IssueStatus::Open),
+            dependency_type: None,
+        }];
+
+        let path = write_beads_jsonl(&[issue], temp.path()).unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let dependency = &parsed["dependencies"][0];
+
+        assert_eq!(dependency["issue_id"].as_str(), Some("with-deps"));
+        assert_eq!(dependency["depends_on_id"].as_str(), Some("dep-1"));
+        assert_eq!(dependency["type"].as_str(), Some("blocks"));
+        assert_eq!(dependency["id"].as_str(), Some("dep-1"));
     }
 
     #[test]

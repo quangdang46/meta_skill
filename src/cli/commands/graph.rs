@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::app::AppContext;
 use crate::cli::output::OutputFormat;
 use crate::error::{MsError, Result};
-use crate::graph::bv::{BvClient, run_bv_on_issues, run_bv_on_issues_raw};
+use crate::graph::bv::{BvClient, run_bv_on_issues};
 use crate::graph::skills::skills_to_issues;
 
 #[derive(Args, Debug)]
@@ -205,26 +205,23 @@ fn run_export(
     args: &GraphExportArgs,
 ) -> Result<()> {
     let arg = format!("--graph-format={}", args.format);
+    let value: serde_json::Value = run_bv_on_issues(client, issues, &["--robot-graph", &arg])?;
+
+    if ctx.output_format != OutputFormat::Human {
+        return crate::cli::output::emit_json(&value);
+    }
+
     if args.format == "json" {
-        let value: serde_json::Value = run_bv_on_issues(client, issues, &["--robot-graph", &arg])?;
-        if ctx.output_format != OutputFormat::Human {
-            return crate::cli::output::emit_json(&value);
-        }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    let output = run_bv_on_issues_raw(client, issues, &["--robot-graph", &arg])?;
-    let graph = String::from_utf8_lossy(&output).to_string();
-    if ctx.output_format != OutputFormat::Human {
-        let value = serde_json::json!({
-            "status": "ok",
-            "format": args.format,
-            "graph": graph,
-        });
-        return crate::cli::output::emit_json(&value);
+    if let Some(graph) = value.get("graph").and_then(|entry| entry.as_str()) {
+        println!("{graph}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
     }
-    println!("{graph}");
+
     Ok(())
 }
 
