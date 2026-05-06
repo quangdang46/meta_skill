@@ -57,35 +57,37 @@ Skills can come from anywhere: hand-written `SKILL.md` files, mined from CASS se
 ## Quick Example
 
 ```bash
-# Initialize: auto-discovers skills in .ms archive
+# Initialize a local ms root (.ms/); also auto-discovers provider/local skills
 ms init
 
-# Route to the best skill for a task
-ms route "error handling"           # returns canonical provider/name ID
+# Optional: configure extra project-local skill paths
+ms config skill_paths.project '["./skills"]'
 
-# Load full skill or a specific section
-ms load community/rust-errors       # full content
-ms load community/rust-errors --section patterns  # one section
+# Index SKILL.md files from configured paths
+ms index
 
-# Compress into a compact summary with rehydrate hints
-ms compress community/rust-errors
-
-# Search and inspect
+# Human discovery flow
 ms search "error handling"
 ms show rust-error-handling
+ms load rust-error-handling --level overview
+ms suggest
 
-# Synchronize provider skill sources
-ms providers sync
+# Agent flow: route first, then load only the needed section
+ms route "error handling"           # returns canonical provider/name ID
+ms load community/rust-errors --section patterns
+ms compress community/rust-errors   # compact summary with rehydrate hints
+
+# Analysis and provider maintenance
+ms graph insights
 ms providers list
-
-# Health check (detects degraded source state)
 ms providers doctor
+ms providers sync
 
 # Start MCP server for AI agent integration
 ms mcp serve
 ```
 
-Key behaviors: `ms init` auto-discovers skill sources. Every skill is archive-backed (Git + SQLite). Deleting a provider folder does not break `show`/`load`/`route` — the archive retains working copies. Skill suggestions adapt via bandit learning. Security layers (ACIP, DCG) protect against prompt injection and destructive commands.
+Key behaviors: the classic `config` + `index` + `search` workflow still works, and newer agent-first flows can start with `ms route`. `ms init` auto-discovers skill sources. Every skill is archive-backed (Git + SQLite). Deleting a provider folder does not break `show`/`load`/`route` — the archive retains working copies. Skill suggestions adapt via bandit learning. Security layers (ACIP, DCG) protect against prompt injection and destructive commands.
 
 ---
 
@@ -278,6 +280,8 @@ Global flags work with all commands:
 ms init                              # Create .ms/ and auto-discover provider/local skills
 ms init --global                     # Create in ~/.local/share/ms/
 ms config                            # Show current config
+ms config skill_paths.project '["./skills"]'
+ms config search.use_embeddings true
 ms providers list                    # Inspect tracked provider roots and last sync state
 ms providers doctor                  # Verify runtime vs source-root health
 ```
@@ -285,8 +289,8 @@ ms providers doctor                  # Verify runtime vs source-root health
 ### Indexing and Discovery
 
 ```bash
-ms index                             # Re-index local/project skill changes
-ms index ./skills /other/path        # Index specific extra paths
+ms index                             # Index all configured skill paths
+ms index ./skills /other/path        # Index specific paths
 ms list                              # List all indexed/archive-backed skills
 ms list --tags rust --layer project  # Filter by tags/layer
 ms show rust-error-handling          # Full skill details
@@ -295,21 +299,24 @@ ms show rust-error-handling --meta   # Metadata only
 
 ### Route-First Workflow
 
+Recommended for AI agents and lazy-load setups:
+
 ```bash
 ms route "error handling" -O json    # Primary agent entry point
 ms load claude/rust-errors --section patterns -O json
 ms search "error handling"           # Fallback when route returns no_match
 ```
 
-### Search and Suggestions
+### Search, Loading, and Suggestions
 
 ```bash
 ms search "async" --search-type bm25      # Lexical only
 ms search "async" --search-type semantic  # Semantic only
+ms load rust-error-handling --level overview
+ms load rust-error-handling --pack 2000
+ms load rust-error-handling --pack 800 --contract debug
 ms suggest                               # Secondary discovery path
 ms suggest --cwd /path/to/project        # Explicit context
-ms load rust-error-handling --level overview
-ms load rust-error-handling --pack 800 --contract debug
 ```
 
 ### Context-Aware Auto-Loading
@@ -701,22 +708,63 @@ Key environment variables:
 ````
 ## ms — Meta Skill CLI
 
-Use `ms` as a route-first skill runtime. `ms init` auto-discovers provider skill folders, snapshots them into `.ms/archive`, and keeps `show`/`load`/`route` working even if the source provider folders are later removed.
+Local-first skill management platform with dual persistence (SQLite + Git), hybrid search (BM25 + hash embeddings via RRF), multi-layer security (ACIP injection defense + DCG command safety), adaptive suggestions (Thompson sampling bandit), and native AI agent integration (MCP server).
 
-### Agent Loop
+`ms init` can auto-discover provider skill folders and snapshot them into `.ms/archive`, but classic project-local `ms config` + `ms index` workflows still work too.
+
+### Core Workflow
+
+```bash
+ms init                              # Initialize
+ms config skill_paths.project '["./skills"]'
+ms index                             # Index skills
+ms search "query"                    # Hybrid search
+ms suggest                           # Context-aware recommendations
+ms load skill-name --pack 2000       # Token-constrained loading
+```
+
+### Route-First Agent Loop
 
 ```bash
 ms route "<task>" -O json
 ms load <canonical-id> --section <slug> -O json
 ms search "<task>" -O json           # only when route returns no_match
-ms providers sync                    # when provider skills change
+ms providers sync                    # when provider skill sources change
 ms providers doctor                  # diagnose degraded source roots
 ```
 
-### Notes
+### For AI Agents
 
+```bash
+ms mcp serve                         # Start MCP server
+ms route "query" -O json             # Primary task-to-skill routing
+ms load <canonical-id> --section <slug> -O json
+ms search "query" -O json            # Fallback/discovery path
+```
+
+### Key Commands
+
+| Command | Purpose |
+|---------|---------|
+| `ms route` | Route a task to the best canonical skill match |
+| `ms search` | Hybrid search (BM25 + semantic) |
+| `ms suggest` | Context-aware suggestions with bandit optimization |
+| `ms load` | Progressive disclosure with token packing |
+| `ms providers` | Manage and diagnose provider roots |
+| `ms graph` | Dependency analysis via bv |
+| `ms security` | ACIP prompt injection defense |
+| `ms safety` | DCG command safety gates |
+| `ms evidence` | Provenance tracking |
+| `ms antipatterns` | Failure pattern detection |
+| `ms template` | Curated authoring templates |
+| `ms bundle` | Portable skill packages |
+| `ms backup` | Snapshot and restore ms state |
+| `ms sync` | Multi-machine synchronization |
+| `ms mcp` | MCP server for AI agents |
+
+Notes:
 - Canonical IDs use `provider/skill-id`.
-- `ms route` is the primary entry point; `ms search` is fallback/discovery.
+- `ms route` is the primary entry point for agents; `ms search` remains useful for discovery and fallback.
 - Deleted provider folders do not break runtime reads, but `ms providers doctor` will report degraded source state until the roots come back.
 ````
 
@@ -739,13 +787,14 @@ ms providers doctor                  # diagnose degraded source roots
 
 ## Troubleshooting
 
-### "No skills found after init"
+### "No skill paths configured" or "No skills found after init"
 
 ```bash
-ms init
-ms providers list
-ms index ./skills                    # if you added project-local skills after init
+ms config skill_paths.project '["./skills"]'
+ms index                             # index configured paths
+ms providers list                    # inspect tracked provider roots
 ms providers sync                    # if provider folders changed after init
+ms providers doctor                  # if runtime/source state looks degraded
 ```
 
 ### "bv is not available"
@@ -760,7 +809,9 @@ cargo install --git https://github.com/Dicklesworthstone/beads_viewer
 ### "Search returns no results"
 
 ```bash
-ms route "your task" -O json         # primary path; inspect decision + fallback
+ms index                             # re-index local/project skills
+ms doctor --fix                      # check for issues
+ms route "your task" -O json         # inspect decision + fallback
 ms search "your task"                # broader fallback discovery
 ms providers doctor                  # source roots may be degraded but runtime still usable
 ms providers sync                    # re-import provider changes if roots changed
