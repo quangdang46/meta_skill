@@ -99,8 +99,15 @@ fn setup_minimal(scenario: &str) -> Result<E2EFixture> {
     Ok(fixture)
 }
 
-fn run_with_cass(fixture: &mut E2EFixture, cass_bin: &Path, args: &[&str]) -> super::fixture::CommandOutput {
-    let mut owned = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+fn run_with_cass(
+    fixture: &mut E2EFixture,
+    cass_bin: &Path,
+    args: &[&str],
+) -> super::fixture::CommandOutput {
+    let mut owned = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     owned.push("--cass-path".to_string());
     owned.push(cass_bin.display().to_string());
     let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
@@ -340,7 +347,8 @@ fn fake_session_json(
 fn write_json(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| MsError::Config(format!("serialize fake cass fixture: {err}")))?;
-    fs::write(path, bytes).map_err(|err| MsError::Config(format!("write {}: {err}", path.display())))
+    fs::write(path, bytes)
+        .map_err(|err| MsError::Config(format!("write {}: {err}", path.display())))
 }
 
 // ============================================================================
@@ -590,7 +598,11 @@ fn test_cross_project_summary_json_output() -> Result<()> {
     fixture.checkpoint("cross-project:pre-summary");
 
     fixture.log_step("Run cross-project summary with robot mode");
-    let output = run_with_cass(&mut fixture, &cass_bin, &["--robot", "cross-project", "summary"]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "summary"],
+    );
     fixture.assert_success(&output, "cross-project summary");
 
     fixture.checkpoint("cross-project:post-summary");
@@ -783,7 +795,9 @@ fn test_cross_project_patterns_json_output() -> Result<()> {
     );
     assert_eq!(json["scanned_sessions"].as_u64(), Some(3));
     assert!(
-        json["patterns"].as_array().is_some_and(|patterns| !patterns.is_empty()),
+        json["patterns"]
+            .as_array()
+            .is_some_and(|patterns| !patterns.is_empty()),
         "Expected at least one cross-project pattern"
     );
 
@@ -852,7 +866,11 @@ fn test_cross_project_gaps_json_output() -> Result<()> {
     fixture.checkpoint("cross-project:pre-gaps");
 
     fixture.log_step("Run cross-project gaps with robot mode");
-    let output = run_with_cass(&mut fixture, &cass_bin, &["--robot", "cross-project", "gaps"]);
+    let output = run_with_cass(
+        &mut fixture,
+        &cass_bin,
+        &["--robot", "cross-project", "gaps"],
+    );
     fixture.assert_success(&output, "cross-project gaps");
 
     fixture.checkpoint("cross-project:post-gaps");

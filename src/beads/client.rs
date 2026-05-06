@@ -12,7 +12,7 @@ use crate::security::SafetyGate;
 
 use super::types::{CreateIssueRequest, Issue, IssueStatus, UpdateIssueRequest, WorkFilter};
 use super::version::{
-    BeadsVersion, VersionCompatibility, MINIMUM_SUPPORTED_VERSION, RECOMMENDED_VERSION,
+    BeadsVersion, MINIMUM_SUPPORTED_VERSION, RECOMMENDED_VERSION, VersionCompatibility,
 };
 
 const BEADS_BIN_ENV: &str = "BEADS_BIN";

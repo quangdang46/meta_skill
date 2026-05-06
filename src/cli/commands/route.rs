@@ -971,8 +971,6 @@ mod tests {
     }
     // ===================== bd-64zk: ms route CLI acceptance tests =====================
 
-    
-
     #[test]
     fn test_threshold_zero_uses_default() {
         let skill = make_skill_record("test-skill", "Test", "A test skill", vec!["test"]);
@@ -988,8 +986,22 @@ mod tests {
         assert_eq!(response.decision, "no_match");
         assert!(response.candidates.is_empty());
         assert!(response.fallback.is_some());
-        assert!(response.fallback.as_ref().unwrap().search_command.contains("ms search"));
-        assert!(response.fallback.as_ref().unwrap().suggest_command.is_none());
+        assert!(
+            response
+                .fallback
+                .as_ref()
+                .unwrap()
+                .search_command
+                .contains("ms search")
+        );
+        assert!(
+            response
+                .fallback
+                .as_ref()
+                .unwrap()
+                .suggest_command
+                .is_none()
+        );
     }
 
     #[test]
@@ -1038,18 +1050,21 @@ mod tests {
                 "execution_mode": "inline"
             })
             .to_string(),
-            ..make_skill_record("codex/shared-id", "Shared", "Another shared skill", vec!["test"])
+            ..make_skill_record(
+                "codex/shared-id",
+                "Shared",
+                "Another shared skill",
+                vec!["test"],
+            )
         };
-        let response = route_task(
-            vec![skill_a, skill_b],
-            "shared id task",
-            3,
-            0.65,
-            false,
-        );
+        let response = route_task(vec![skill_a, skill_b], "shared id task", 3, 0.65, false);
         assert_eq!(response.decision, "match");
         assert_eq!(response.candidates.len(), 2);
-        let ids: Vec<_> = response.candidates.iter().map(|c| c.skill_id.clone()).collect();
+        let ids: Vec<_> = response
+            .candidates
+            .iter()
+            .map(|c| c.skill_id.clone())
+            .collect();
         assert!(ids.contains(&"claude/shared-id".to_string()));
         assert!(ids.contains(&"codex/shared-id".to_string()));
         for cand in &response.candidates {
@@ -1066,7 +1081,10 @@ mod tests {
         let skill = make_skill_record("test-skill", "Test", "A test skill", vec!["test"]);
         let response = route_task(vec![skill], "test", 3, 0.65, false);
         if let Some(ref fb) = response.fallback {
-            assert!(fb.suggest_command.is_none(), "suggest_command must not be fabricated");
+            assert!(
+                fb.suggest_command.is_none(),
+                "suggest_command must not be fabricated"
+            );
         }
     }
 }

@@ -22,13 +22,13 @@ fn cass_fixture_root() -> PathBuf {
 
 fn copy_cass_fixture(relative_path: &str, destination: &Path) -> Result<()> {
     let source = cass_fixture_root().join(relative_path);
-    fs::copy(&source, destination)
-        .map(|_| ())
-        .map_err(|err| ms::error::MsError::Config(format!(
+    fs::copy(&source, destination).map(|_| ()).map_err(|err| {
+        ms::error::MsError::Config(format!(
             "copy CASS fixture {} -> {} failed: {err}",
             source.display(),
             destination.display()
-        )))
+        ))
+    })
 }
 
 /// Test the full CASS integration workflow.

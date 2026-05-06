@@ -745,10 +745,12 @@ requires:
         let spec = TestSpec::from_yaml(yaml).unwrap();
         let result = spec.check_requirements();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("command not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("command not found")
+        );
     }
 
     #[test]

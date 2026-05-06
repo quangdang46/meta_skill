@@ -109,11 +109,7 @@ fn extract_version_fragment(input: &str) -> Option<String> {
         }
     }
 
-    if started {
-        Some(out)
-    } else {
-        None
-    }
+    if started { Some(out) } else { None }
 }
 
 #[cfg(test)]

@@ -1463,8 +1463,8 @@ impl E2EFixture {
             toml::Value::Array(vec![toml::Value::String("./local_skills".to_string())]),
         );
 
-        let rendered =
-            toml::to_string_pretty(&doc).expect("Failed to render fixture config after path update");
+        let rendered = toml::to_string_pretty(&doc)
+            .expect("Failed to render fixture config after path update");
         std::fs::write(&self.config_path, rendered)
             .expect("Failed to persist fixture config path update");
 

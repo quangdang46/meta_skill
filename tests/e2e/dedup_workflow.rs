@@ -355,7 +355,10 @@ fn test_dedup_merge_marks_secondary_deprecated() -> Result<()> {
     assert_eq!(json["status"].as_str(), Some("ok"));
     assert_eq!(json["action"].as_str(), Some("merge"));
     assert_eq!(json["primary"]["id"].as_str(), Some("rust-error-handling"));
-    assert_eq!(json["secondary"]["id"].as_str(), Some("rust-error-patterns"));
+    assert_eq!(
+        json["secondary"]["id"].as_str(),
+        Some("rust-error-patterns")
+    );
     assert_eq!(json["secondary"]["deprecated"].as_bool(), Some(true));
     assert_eq!(json["secondary"]["reason"].as_str(), Some(reason));
 

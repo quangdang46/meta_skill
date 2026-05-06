@@ -336,7 +336,11 @@ impl TestFixture {
 
         if self.config_path.exists() {
             let init = clone.init();
-            assert!(init.success, "Failed to init cloned fixture: {}", init.stderr);
+            assert!(
+                init.success,
+                "Failed to init cloned fixture: {}",
+                init.stderr
+            );
 
             if self.db_path().exists() || self.index_path.exists() {
                 let index = clone.run_ms(&["--robot", "index"]);
@@ -390,9 +394,9 @@ impl TestFixture {
             _ => return None,
         };
 
-        self.db.as_ref().and_then(|db| {
-            db.query_row::<i64, _, _>(sql, [], |row| row.get(0)).ok()
-        })
+        self.db
+            .as_ref()
+            .and_then(|db| db.query_row::<i64, _, _>(sql, [], |row| row.get(0)).ok())
     }
 
     /// Compare two test skills and summarize the meaningful differences.
@@ -441,7 +445,11 @@ impl TestFixture {
             "# Node Testing\n\nUse a fast Node.js test runner and keep I/O isolated.\n",
         ));
         let index = fixture.run_ms(&["--robot", "index"]);
-        assert!(index.success, "Failed to index Node fixture: {}", index.stderr);
+        assert!(
+            index.success,
+            "Failed to index Node fixture: {}",
+            index.stderr
+        );
         fixture.open_db();
 
         fixture
@@ -1183,7 +1191,11 @@ mod enhancement_tests {
         assert!(isolated.config_path.exists());
         assert_eq!(isolated.db_row_count("skills"), Some(3));
         assert!(
-            isolated.skills_dir.join("rust-error-handling").join("SKILL.md").exists(),
+            isolated
+                .skills_dir
+                .join("rust-error-handling")
+                .join("SKILL.md")
+                .exists(),
             "isolated fixture should copy project skills"
         );
     }
