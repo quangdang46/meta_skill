@@ -2,6 +2,7 @@
 
 pub mod dependencies;
 pub mod disclosure;
+pub mod ids;
 pub mod layering;
 pub mod overlay;
 pub mod pack_contracts;
@@ -20,6 +21,9 @@ pub mod validation;
 pub use dependencies::{
     DependencyGraph, DependencyLoadMode, DependencyResolver, DisclosureLevel,
     ResolvedDependencyPlan, SkillLoadPlan,
+};
+pub use ids::{
+    CanonicalId, CollisionReport, Provenance, SkillIdCollision, detect_collisions, is_unambiguous,
 };
 pub use layering::{
     BlockDiff, ConflictDetail, ConflictResolution, ConflictStrategy, LayeredRegistry,
@@ -40,12 +44,14 @@ pub use resolution::{
     resolve_extends, resolve_full,
 };
 pub use resolution_cache::{
-    CacheKey, CacheStats, CachedResolvedSkill, DependencyGraph as ResolutionDependencyGraph,
-    ResolutionCache,
+    CacheKey, CacheStats, CachedResolvedSkill, ContentCacheKey,
+    DependencyGraph as ResolutionDependencyGraph, ResolutionCache, SkillContentCache,
+    SkillContentCacheEntry,
 };
 pub use skill::{
-    BlockType, EvidenceCoverage, EvidenceLevel, EvidenceRef, Skill, SkillBlock, SkillEvidenceIndex,
-    SkillLayer, SkillMetadata, SkillSection, SkillSpec,
+    BlockType, EvidenceCoverage, EvidenceLevel, EvidenceRef, ReferenceFile, ScriptFile, Skill,
+    SkillAssets, SkillBlock, SkillEvidenceIndex, SkillLayer, SkillMetadata, SkillProvenance,
+    SkillSection, SkillSpec, TestFile,
 };
 pub use slicing::{SkillSliceIndex, SkillSlicer};
 pub use spec_migration::migrate_spec;

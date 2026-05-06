@@ -58,6 +58,8 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
                 replace_pitfalls: false,
                 replace_checklist: false,
                 includes: Vec::new(),
+                archive_format_version: None,
+                provenance: None,
             },
         )
 }

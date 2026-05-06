@@ -181,6 +181,7 @@ mod tests {
             modified_at: String::new(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         }
     }
 
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_skills_to_issues_labels_and_status() {
-        let skill = SkillRecord {
+        let skill = crate::storage::sqlite::SkillRecord {
             id: "skill-x".to_string(),
             name: "Skill X".to_string(),
             description: String::new(),
@@ -233,6 +234,7 @@ mod tests {
             modified_at: String::new(),
             is_deprecated: true,
             deprecation_reason: None,
+            ..Default::default()
         };
 
         let issues = skills_to_issues(&[skill]).unwrap();

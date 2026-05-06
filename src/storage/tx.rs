@@ -422,10 +422,11 @@ impl TxManager {
 
     /// Write a skill with 2PC guarantees and an explicit layer
     pub fn write_skill_with_layer(&self, skill: &SkillSpec, layer: SkillLayer) -> Result<()> {
-        let tx = TxRecord::prepare("skill", &skill.metadata.id, skill)?;
+        let storage_id = skill.storage_id();
+        let tx = TxRecord::prepare("skill", &storage_id, skill)?;
         debug!(
             "Starting 2PC transaction {} for skill {}",
-            tx.id, skill.metadata.id
+            tx.id, storage_id
         );
 
         // Phase 1: Prepare - write intent
@@ -445,7 +446,7 @@ impl TxManager {
 
         info!(
             "2PC transaction {} completed for skill {}",
-            tx.id, skill.metadata.id
+            tx.id, storage_id
         );
         Ok(())
     }
@@ -600,13 +601,12 @@ impl TxManager {
 
         let skill: SkillSpec = serde_json::from_str(&tx.payload_json)
             .map_err(|e| MsError::TransactionFailed(format!("deserialize skill: {e}")))?;
+        let storage_id = skill.storage_id();
 
         // Update skill with final values
-        let git_path = self
-            .git
-            .root()
-            .join("skills/by-id")
-            .join(&skill.metadata.id);
+        let git_path = self.git.skill_path(&storage_id).ok_or_else(|| {
+            MsError::TransactionFailed(format!("invalid skill id for archive path: {storage_id}"))
+        })?;
         let git_path_str = git_path.to_string_lossy();
         let content_hash = compute_content_hash(&skill)?;
 
@@ -614,7 +614,7 @@ impl TxManager {
         let body = compile_markdown(&skill);
 
         self.db
-            .finalize_skill_commit(&skill.metadata.id, &git_path_str, &content_hash, &body)?;
+            .finalize_skill_commit(&storage_id, &git_path_str, &content_hash, &body)?;
 
         // Update phase
         let mut tx = tx.clone();

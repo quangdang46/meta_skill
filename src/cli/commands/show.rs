@@ -9,6 +9,7 @@ use tracing::debug;
 
 use crate::app::AppContext;
 use crate::cli::output::OutputFormat;
+use crate::core::disclosure::sanitize_slug;
 use crate::error::{MsError, Result};
 use crate::output::{
     is_agent_environment, is_ci_environment, key_value_table, skill_detail_panel, warning_panel,
@@ -35,18 +36,40 @@ pub struct ShowArgs {
 
 pub fn run(ctx: &AppContext, args: &ShowArgs) -> Result<()> {
     // Try to find skill by ID or name
-    let skill = ctx
-        .db
-        .get_skill(&args.skill)?
-        .or_else(|| {
-            // Try alias resolution
-            ctx.db
-                .resolve_alias(&args.skill)
-                .ok()
-                .flatten()
-                .and_then(|res| ctx.db.get_skill(&res.canonical_id).ok().flatten())
-        })
-        .ok_or_else(|| MsError::SkillNotFound(format!("skill not found: {}", args.skill)))?;
+    let direct = ctx.db.get_skill(&args.skill)?;
+
+    let skill = if args.skill.contains('/') {
+        direct.ok_or_else(|| MsError::SkillNotFound(format!("skill not found: {}", args.skill)))?
+    } else if let Some(resolution) = ctx.db.resolve_alias(&args.skill)? {
+        ctx.db
+            .get_skill(&resolution.canonical_id)?
+            .ok_or_else(|| MsError::SkillNotFound(format!("skill not found: {}", args.skill)))?
+    } else {
+        let mut matches = ctx.db.find_skills_by_metadata_ref(&args.skill)?;
+        if let Some(skill) = &direct {
+            if !matches.iter().any(|candidate| candidate.id == skill.id) {
+                matches.push(skill.clone());
+            }
+        }
+
+        match matches.as_slice() {
+            [skill] => skill.clone(),
+            [] => direct.ok_or_else(|| {
+                MsError::SkillNotFound(format!("skill not found: {}", args.skill))
+            })?,
+            matches => {
+                let ids = matches
+                    .iter()
+                    .map(skill_machine_id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(MsError::ValidationFailed(format!(
+                    "skill reference '{}' is ambiguous; use one of: {}",
+                    args.skill, ids
+                )));
+            }
+        }
+    };
 
     display_skill(ctx, &skill, args)
 }
@@ -91,12 +114,22 @@ fn show_human_rich(skill: &SkillRecord, args: &ShowArgs, width: usize) -> Result
     );
     println!("{panel}");
 
+    // Build display ID with provider prefix when applicable
+    let display_id = skill_machine_id(skill);
+
     // Metadata table
     let mut pairs: Vec<(&str, String)> = vec![
-        ("ID", skill.id.clone()),
+        ("ID", display_id),
         (
             "Version",
             skill.version.as_deref().unwrap_or("-").to_string(),
+        ),
+        (
+            "Provider",
+            skill
+                .provider
+                .clone()
+                .unwrap_or_else(|| "local".to_string()),
         ),
         ("Layer", normalize_layer(&skill.source_layer)),
         ("Source", skill.source_path.clone()),
@@ -179,11 +212,10 @@ fn show_human_plain(skill: &SkillRecord, args: &ShowArgs) -> Result<()> {
     println!();
 
     // Core fields
-    println!("ID:      {}", skill.id);
-    println!(
-        "Version: {}",
-        skill.version.as_deref().unwrap_or("-")
-    );
+    let display_id = skill_machine_id(skill);
+    println!("ID:      {}", display_id);
+    println!("Version: {}", skill.version.as_deref().unwrap_or("-"));
+    println!("Provider: {}", skill.provider.as_deref().unwrap_or("local"));
     if let Some(ref author) = skill.author {
         println!("Author:  {author}");
     }
@@ -287,10 +319,16 @@ fn show_deps(skill: &SkillRecord) {
 }
 
 fn show_json(skill: &SkillRecord, args: &ShowArgs, pretty: bool) -> Result<()> {
+    let section_slugs = extract_section_slugs(&skill.body);
+    let canonical_id = skill_machine_id(skill);
+    let display_id = skill_display_id(skill);
+
     let mut output = serde_json::json!({
         "status": "ok",
         "skill": {
-            "id": skill.id,
+            "id": canonical_id,
+            "stored_id": skill.id,
+            "display_id": display_id,
             "name": skill.name,
             "version": skill.version,
             "description": skill.description,
@@ -306,6 +344,7 @@ fn show_json(skill: &SkillRecord, args: &ShowArgs, pretty: bool) -> Result<()> {
             "modified_at": skill.modified_at,
             "is_deprecated": skill.is_deprecated,
             "deprecation_reason": skill.deprecation_reason,
+            "section_slugs": section_slugs,
         }
     });
 
@@ -336,6 +375,21 @@ fn show_json(skill: &SkillRecord, args: &ShowArgs, pretty: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Extract section slugs from a skill body by parsing headings.
+fn extract_section_slugs(body: &str) -> Vec<String> {
+    let mut slugs = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            let title = trimmed.trim_start_matches("## ").trim();
+            if !title.is_empty() {
+                slugs.push(sanitize_slug(title));
+            }
+        }
+    }
+    slugs
 }
 
 /// Format as plain YAML-like key-value (bd-olwb spec).
@@ -415,10 +469,16 @@ fn show_tsv(skill: &SkillRecord) -> Result<()> {
 }
 
 fn show_toon(skill: &SkillRecord, args: &ShowArgs) -> Result<()> {
+    let section_slugs = extract_section_slugs(&skill.body);
+    let canonical_id = skill_machine_id(skill);
+    let display_id = skill_display_id(skill);
+
     let mut output = serde_json::json!({
         "status": "ok",
         "skill": {
-            "id": skill.id,
+            "id": canonical_id,
+            "stored_id": skill.id,
+            "display_id": display_id,
             "name": skill.name,
             "version": skill.version,
             "description": skill.description,
@@ -434,6 +494,7 @@ fn show_toon(skill: &SkillRecord, args: &ShowArgs) -> Result<()> {
             "modified_at": skill.modified_at,
             "is_deprecated": skill.is_deprecated,
             "deprecation_reason": skill.deprecation_reason,
+            "section_slugs": section_slugs,
         }
     });
 
@@ -485,6 +546,40 @@ fn should_use_rich_for_show() -> bool {
 
     // Not a terminal -> plain
     std::io::stdout().is_terminal()
+}
+
+fn skill_machine_id(skill: &SkillRecord) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    metadata
+        .get("canonical_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if skill.id.contains('/') {
+                Some(skill.id.clone())
+            } else {
+                skill.provider.as_deref().map(|provider| {
+                    if provider == "local" {
+                        skill.id.clone()
+                    } else {
+                        format!("{provider}/{}", skill.id)
+                    }
+                })
+            }
+        })
+        .unwrap_or_else(|| skill.id.clone())
+}
+
+fn skill_display_id(skill: &SkillRecord) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    metadata
+        .get("display_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| skill.id.clone())
 }
 
 /// Get the terminal width, defaulting to 80 if detection fails.
@@ -540,6 +635,7 @@ mod tests {
             deprecation_reason: None,
             git_remote: Some("https://github.com/example/repo".to_string()),
             git_commit: Some("deadbeef12345678".to_string()),
+            ..Default::default()
         }
     }
 
@@ -573,8 +669,7 @@ mod tests {
             ("Layer", normalize_layer(&skill.source_layer)),
             ("Source", skill.source_path.clone()),
         ];
-        let table_data: Vec<(&str, &str)> =
-            pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let table_data: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let table = key_value_table(&table_data);
         let rendered = table.render_plain(80);
         assert!(rendered.contains("sk-abc123"), "table should contain ID");
@@ -642,10 +737,7 @@ mod tests {
         let skill = make_skill();
         // Plain format produces YAML-like key-value pairs
         let meta: serde_json::Value = serde_json::from_str(&skill.metadata_json).unwrap();
-        let skill_type = meta
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("skill");
+        let skill_type = meta.get("type").and_then(|t| t.as_str()).unwrap_or("skill");
         assert_eq!(skill_type, "tool");
 
         // Verify all plain output fields are available
@@ -722,8 +814,8 @@ mod tests {
         let hash_trunc = &skill.content_hash[..skill.content_hash.len().min(16)];
         assert_eq!(hash_trunc, "abcdef0123456789");
 
-        let commit_trunc = &skill.git_commit.as_ref().unwrap()
-            [..skill.git_commit.as_ref().unwrap().len().min(8)];
+        let commit_trunc =
+            &skill.git_commit.as_ref().unwrap()[..skill.git_commit.as_ref().unwrap().len().min(8)];
         assert_eq!(commit_trunc, "deadbeef");
     }
 
@@ -777,10 +869,7 @@ mod tests {
         skill.is_deprecated = true;
         skill.deprecation_reason = Some("Use v2 instead".to_string());
 
-        let warn = warning_panel(
-            "DEPRECATED",
-            skill.deprecation_reason.as_deref().unwrap(),
-        );
+        let warn = warning_panel("DEPRECATED", skill.deprecation_reason.as_deref().unwrap());
         let rendered = format!("{warn}");
         assert!(!rendered.is_empty(), "warning panel should render");
     }
@@ -791,10 +880,7 @@ mod tests {
     fn test_show_deps_parsing() {
         let skill = make_skill();
         let meta: serde_json::Value = serde_json::from_str(&skill.metadata_json).unwrap();
-        let requires = meta
-            .get("requires")
-            .and_then(|d| d.as_array())
-            .unwrap();
+        let requires = meta.get("requires").and_then(|d| d.as_array()).unwrap();
         assert_eq!(requires.len(), 2);
         assert_eq!(requires[0].as_str().unwrap(), "dep-a");
         assert_eq!(requires[1].as_str().unwrap(), "dep-b");

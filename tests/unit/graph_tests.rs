@@ -29,6 +29,7 @@ fn base_skill_record(id: &str) -> SkillRecord {
         description: String::new(),
         version: Some("0.1.0".to_string()),
         author: None,
+        provider: None,
         source_path: String::new(),
         source_layer: "project".to_string(),
         git_remote: None,
@@ -43,6 +44,8 @@ fn base_skill_record(id: &str) -> SkillRecord {
         modified_at: String::new(),
         is_deprecated: false,
         deprecation_reason: None,
+        archive_format_version: None,
+        provenance_json: "{}".to_string(),
     }
 }
 

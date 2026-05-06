@@ -12,6 +12,7 @@ use crate::core::skill::{
     BlockType, IncludePosition, IncludeTarget, SkillBlock, SkillInclude, SkillSection, SkillSpec,
 };
 use crate::error::{MsError, Result};
+use crate::storage::merge_skill_metadata;
 
 /// Maximum inheritance depth before warning
 pub const MAX_INHERITANCE_DEPTH: usize = 5;
@@ -68,7 +69,8 @@ impl<'a> SkillRepository for DbSkillRepository<'a> {
             return Ok(None);
         };
         // Parse the body to get the spec
-        let spec = crate::core::spec_lens::parse_markdown(&record.body)?;
+        let mut spec = crate::core::spec_lens::parse_markdown(&record.body)?;
+        spec.metadata = merge_skill_metadata(&record, &spec.metadata);
         Ok(Some(spec))
     }
 }
@@ -216,18 +218,18 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
     let Some(parent_id) = &skill.extends else {
         return Ok(ResolvedSkillSpec {
             spec: skill.clone(),
-            inheritance_chain: vec![skill.metadata.id.clone()],
+            inheritance_chain: vec![skill.storage_id()],
             included_from: Vec::new(),
             warnings,
         });
     };
 
     // Check for cycles first
-    match detect_inheritance_cycle(&skill.metadata.id, repository)? {
+    match detect_inheritance_cycle(&skill.storage_id(), repository)? {
         CycleDetectionResult::NoCycle => {}
         CycleDetectionResult::CycleFound(cycle) => {
             return Err(MsError::CyclicInheritance {
-                skill_id: skill.metadata.id.clone(),
+                skill_id: skill.storage_id(),
                 cycle,
             });
         }
@@ -238,7 +240,7 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
         .get(parent_id)?
         .ok_or_else(|| MsError::ParentSkillNotFound {
             parent_id: parent_id.clone(),
-            child_id: skill.metadata.id.clone(),
+            child_id: skill.storage_id(),
         })?;
 
     // Recursively resolve parent
@@ -248,7 +250,7 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
     let depth = resolved_parent.inheritance_chain.len() + 1;
     if depth > MAX_INHERITANCE_DEPTH {
         let mut chain = resolved_parent.inheritance_chain.clone();
-        chain.push(skill.metadata.id.clone());
+        chain.push(skill.storage_id());
         warnings.push(ResolutionWarning::DeepInheritance { depth, chain });
     }
 
@@ -257,7 +259,7 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
 
     // Build inheritance chain
     let mut inheritance_chain = resolved_parent.inheritance_chain;
-    inheritance_chain.push(skill.metadata.id.clone());
+    inheritance_chain.push(skill.storage_id());
 
     // Collect all warnings
     warnings.extend(resolved_parent.warnings);
@@ -280,6 +282,9 @@ fn merge_skills(
 
     // Always replace these from child
     result.metadata.id = child.metadata.id.clone();
+    result.metadata.provider = child.metadata.provider.clone();
+    result.metadata.canonical_id = child.metadata.canonical_id.clone();
+    result.metadata.display_id = child.metadata.display_id.clone();
     result.format_version = child.format_version.clone();
 
     // Replace metadata if child provides it
@@ -448,11 +453,11 @@ pub fn resolve_full<R: SkillRepository + ?Sized>(
     let mut resolved = resolve_extends(skill, repository)?;
 
     // Check for cycles involving includes
-    match detect_full_cycle(&skill.metadata.id, repository)? {
+    match detect_full_cycle(&skill.storage_id(), repository)? {
         CycleDetectionResult::NoCycle => {}
         CycleDetectionResult::CycleFound(cycle) => {
             return Err(MsError::CyclicInheritance {
-                skill_id: skill.metadata.id.clone(),
+                skill_id: skill.storage_id(),
                 cycle,
             });
         }
@@ -485,7 +490,7 @@ fn resolve_includes<R: SkillRepository + ?Sized>(
                     .warnings
                     .push(ResolutionWarning::IncludedSkillNotFound {
                         skill_id: include.skill.clone(),
-                        included_by: resolved.spec.metadata.id.clone(),
+                        included_by: resolved.spec.storage_id(),
                     });
                 continue;
             }

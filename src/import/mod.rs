@@ -32,6 +32,7 @@ mod classifiers;
 pub mod formatting;
 mod generator;
 mod parser;
+pub mod provider;
 mod types;
 
 pub use classifiers::*;

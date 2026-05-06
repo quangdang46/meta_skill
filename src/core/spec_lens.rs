@@ -210,6 +210,8 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
         replace_checklist: false,
         // Composition fields - not parsed from markdown (use YAML frontmatter)
         includes: Vec::new(),
+        archive_format_version: None,
+        provenance: None,
     })
 }
 

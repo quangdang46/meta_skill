@@ -49,6 +49,40 @@ fn test_fixture_with_sample_bundles() {
 }
 
 #[test]
+fn test_fixture_with_mock_cass_uses_real_fixtures() {
+    let fixture = TestFixture::with_mock_cass("test_fixture_with_mock_cass_uses_real_fixtures");
+
+    let sessions_dir = fixture.root.join("mock_cass").join("sessions");
+    let extractions_dir = fixture.root.join("mock_cass").join("extractions");
+
+    for session_name in [
+        "session-001.jsonl",
+        "session-002.jsonl",
+        "session-003.jsonl",
+    ] {
+        let session_path = sessions_dir.join(session_name);
+        assert!(session_path.exists(), "{session_name} should exist");
+
+        let size = std::fs::metadata(&session_path)
+            .expect("session fixture metadata")
+            .len();
+        assert!(size < 1024, "{session_name} should stay under 1KB");
+    }
+
+    let extraction_path = extractions_dir.join("debugging-skill.json");
+    assert!(
+        extraction_path.exists(),
+        "debugging extraction should exist"
+    );
+
+    let extraction = std::fs::read_to_string(&extraction_path).expect("read extraction fixture");
+    assert!(
+        extraction.contains("\"skill_name\": \"rust-debugging\""),
+        "extraction fixture should come from repo-backed test data"
+    );
+}
+
+#[test]
 fn test_dump_directory_tree() {
     let fixture = TestFixture::new("test_dump_directory_tree");
 

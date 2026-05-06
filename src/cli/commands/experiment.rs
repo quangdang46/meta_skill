@@ -457,6 +457,7 @@ fn run_load(ctx: &AppContext, args: &ExperimentLoadArgs) -> Result<()> {
         confirm: false,
         dry_run: false,
         level: args.level.clone(),
+        section: None,
         pack: args.pack,
         mode: args.mode,
         contract: args.contract,

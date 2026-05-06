@@ -226,6 +226,7 @@ mod tests {
             modified_at: "2025-01-01T00:00:00Z".to_string(),
             is_deprecated: false,
             deprecation_reason: None,
+            ..Default::default()
         }
     }
 

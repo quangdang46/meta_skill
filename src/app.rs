@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::cli::OutputFormat;
 use crate::config::Config;
 use crate::error::{MsError, Result};
-use crate::search::SearchIndex;
+use crate::search::{CacheLayer, SearchIndex};
 use crate::storage::{Database, GitArchive};
 
 pub struct AppContext {
@@ -14,6 +14,7 @@ pub struct AppContext {
     pub db: Arc<Database>,
     pub git: Arc<GitArchive>,
     pub search: Arc<SearchIndex>,
+    pub cache: Arc<CacheLayer>,
     /// Deprecated: use output_format instead
     pub robot_mode: bool,
     pub output_format: OutputFormat,
@@ -35,12 +36,14 @@ impl AppContext {
             config,
             db: Arc::new(Database::open(ms_root.join("ms.db"))?),
             git: Arc::new(GitArchive::open(ms_root.join("archive"))?),
+            cache: Arc::new(CacheLayer::new()),
             search: Arc::new({
                 let index_path = ms_root.join("index");
                 // Try writable first; if the write lock is busy (another process),
                 // fall back to read-only mode so concurrent MCP servers and CLI
                 // commands can coexist without "LockBusy" errors.
-                SearchIndex::open(&index_path).or_else(|_| SearchIndex::open_readonly(&index_path))?
+                SearchIndex::open(&index_path)
+                    .or_else(|_| SearchIndex::open_readonly(&index_path))?
             }),
             robot_mode: cli.robot,
             output_format: cli.output_format(),

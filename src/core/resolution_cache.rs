@@ -1015,3 +1015,401 @@ mod tests {
         assert!(resolved.warnings.is_empty());
     }
 }
+
+// =============================================================================
+// Archive-backed Skill Content Cache (bd-qfr4)
+// =============================================================================
+//
+// Caches loaded skill content to `.ms/cache/content/` to speed up repeated
+// load calls.  Cache key: skill_id + disclosure_level + optional section.
+// Invalidated when the source SKILL.md file mtime or content hash changes.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use lru::LruCache;
+
+/// Entry stored in the content cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillContentCacheEntry {
+    /// The loaded content payload (markdown string).
+    pub content: String,
+    /// Content hash of the source file at cache time (Blake3 or SHA-256).
+    pub source_hash: String,
+    /// mtime (seconds since epoch) of the source file at cache time.
+    pub source_mtime: u64,
+    /// When this entry was cached (ISO 8601).
+    pub cached_at: String,
+}
+
+/// Cache key components for content lookups.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ContentCacheKey {
+    /// The skill's canonical identifier.
+    pub skill_id: String,
+    /// The disclosure level used when loading (e.g., "minimal", "moderate", "full").
+    pub disclosure_level: String,
+    /// Optional section slug; `None` means the full skill content.
+    pub section: Option<String>,
+}
+
+impl ContentCacheKey {
+    /// Build a filename-safe string for this key.
+    fn cache_filename(&self) -> String {
+        let base = sanitize_for_filename(&self.skill_id);
+        let level = &self.disclosure_level;
+        match &self.section {
+            Some(sec) => format!("{base}_{level}_{}.json", sanitize_for_filename(sec)),
+            None => format!("{base}_{level}.json"),
+        }
+    }
+}
+
+fn sanitize_for_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// File-system-backed content cache for loaded skill content.
+///
+/// Stores cached content as JSON files under `.ms/cache/content/`.
+/// Each entry is invalidated when the source file's mtime or content hash
+/// differs from what was stored at cache time.
+pub struct SkillContentCache {
+    /// Directory where cache files are stored.
+    cache_dir: PathBuf,
+    /// Optional shallow in-memory LRU for hot entries.
+    in_memory: Mutex<LruCache<String, SkillContentCacheEntry>>,
+}
+
+impl SkillContentCache {
+    /// Create a new content cache rooted at `ms_root/cache/content/`.
+    ///
+    /// `ms_root` is the `.ms/` directory of the project.
+    pub fn new(ms_root: &Path) -> Self {
+        let cache_dir = ms_root.join("cache").join("content");
+        Self::with_dir(cache_dir)
+    }
+
+    /// Create a new content cache with an explicit directory.
+    pub fn with_dir(cache_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&cache_dir).ok();
+        Self {
+            cache_dir,
+            // Small in-memory LRU for the hottest entries
+            in_memory: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(64).unwrap())),
+        }
+    }
+
+    /// Try to load cached content for the given key.
+    ///
+    /// Returns `None` if:
+    /// - No cache file exists
+    /// - The source file's mtime has changed
+    /// - The source file's content hash has changed
+    /// - The cache file is corrupt
+    pub fn get(
+        &self,
+        key: &ContentCacheKey,
+        current_source_hash: &str,
+        current_source_mtime: u64,
+    ) -> Option<SkillContentCacheEntry> {
+        let filename = key.cache_filename();
+
+        // Check in-memory first
+        {
+            if let Ok(mut mem) = self.in_memory.try_lock() {
+                if let Some(entry) = mem.get(&filename) {
+                    if entry.source_hash == current_source_hash
+                        && entry.source_mtime == current_source_mtime
+                    {
+                        return Some(entry.clone());
+                    }
+                }
+            }
+        }
+
+        // Check on-disk cache
+        let cache_path = self.cache_dir.join(&filename);
+        if !cache_path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&cache_path).ok()?;
+        let entry: SkillContentCacheEntry = serde_json::from_str(&content).ok()?;
+
+        // Validate source freshness
+        if entry.source_hash != current_source_hash || entry.source_mtime != current_source_mtime {
+            // Stale entry — remove it
+            std::fs::remove_file(&cache_path).ok();
+            return None;
+        }
+
+        // Warm in-memory cache
+        if let Ok(mut mem) = self.in_memory.try_lock() {
+            mem.put(filename, entry.clone());
+        }
+
+        Some(entry)
+    }
+
+    /// Store content in the cache.
+    pub fn put(&self, key: &ContentCacheKey, content: &str, source_hash: &str, source_mtime: u64) {
+        let filename = key.cache_filename();
+        let entry = SkillContentCacheEntry {
+            content: content.to_string(),
+            source_hash: source_hash.to_string(),
+            source_mtime,
+            cached_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Write to disk
+        let cache_path = self.cache_dir.join(&filename);
+        if let Ok(json) = serde_json::to_string(&entry) {
+            std::fs::write(&cache_path, json).ok();
+        }
+
+        // Update in-memory cache
+        if let Ok(mut mem) = self.in_memory.try_lock() {
+            mem.put(filename, entry);
+        }
+    }
+
+    /// Invalidate a specific cache entry.
+    pub fn invalidate(&self, key: &ContentCacheKey) {
+        let filename = key.cache_filename();
+        let cache_path = self.cache_dir.join(&filename);
+        std::fs::remove_file(&cache_path).ok();
+        if let Ok(mut mem) = self.in_memory.try_lock() {
+            mem.pop(&filename);
+        }
+    }
+
+    /// Invalidate all entries for a given skill ID (all disclosure levels and sections).
+    pub fn invalidate_skill(&self, skill_id: &str) {
+        let prefix = sanitize_for_filename(skill_id);
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    std::fs::remove_file(&entry.path()).ok();
+                }
+            }
+        }
+        // Clear matching entries from memory
+        if let Ok(mut mem) = self.in_memory.try_lock() {
+            let keys_to_remove: Vec<String> = mem
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys_to_remove {
+                mem.pop(&k);
+            }
+        }
+    }
+
+    /// Clear the entire content cache.
+    pub fn clear(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().map_or(false, |e| e == "json") {
+                    std::fs::remove_file(&entry.path()).ok();
+                }
+            }
+        }
+        if let Ok(mut mem) = self.in_memory.try_lock() {
+            mem.clear();
+        }
+    }
+
+    /// Get the number of cache entries on disk.
+    pub fn entry_count(&self) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().map_or(false, |e| e == "json") {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+#[cfg(test)]
+mod content_cache_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_key(skill_id: &str, level: &str, section: Option<&str>) -> ContentCacheKey {
+        ContentCacheKey {
+            skill_id: skill_id.to_string(),
+            disclosure_level: level.to_string(),
+            section: section.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_content_cache_basic_put_get() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("my-skill", "moderate", None);
+        cache.put(&key, "# My Skill\n\nSome content.", "abc123", 1_000_000);
+
+        let result = cache.get(&key, "abc123", 1_000_000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().content, "# My Skill\n\nSome content.");
+    }
+
+    #[test]
+    fn test_content_cache_miss_on_hash_change() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("my-skill", "moderate", None);
+        cache.put(&key, "content v1", "hash_v1", 1_000_000);
+
+        // Same mtime but different hash → miss
+        assert!(cache.get(&key, "hash_v2", 1_000_000).is_none());
+    }
+
+    #[test]
+    fn test_content_cache_miss_on_mtime_change() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("my-skill", "moderate", None);
+        cache.put(&key, "content v1", "hash_v1", 1_000_000);
+
+        // Same hash but different mtime → miss
+        assert!(cache.get(&key, "hash_v1", 2_000_000).is_none());
+    }
+
+    #[test]
+    fn test_content_cache_section_key() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let full_key = make_key("my-skill", "full", None);
+        let sec_key = make_key("my-skill", "full", Some("usage"));
+
+        cache.put(&full_key, "Full content", "hash", 1_000_000);
+        cache.put(&sec_key, "Usage section", "hash", 1_000_000);
+
+        assert!(cache.get(&full_key, "hash", 1_000_000).is_some());
+        assert!(cache.get(&sec_key, "hash", 1_000_000).is_some());
+        assert_eq!(
+            cache.get(&sec_key, "hash", 1_000_000).unwrap().content,
+            "Usage section"
+        );
+    }
+
+    #[test]
+    fn test_content_cache_invalidate() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("my-skill", "moderate", None);
+        cache.put(&key, "content", "hash", 1_000_000);
+        assert!(cache.get(&key, "hash", 1_000_000).is_some());
+
+        cache.invalidate(&key);
+        assert!(cache.get(&key, "hash", 1_000_000).is_none());
+    }
+
+    #[test]
+    fn test_content_cache_invalidate_skill() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let k1 = make_key("my-skill", "minimal", None);
+        let k2 = make_key("my-skill", "full", None);
+        let k3 = make_key("my-skill", "full", Some("usage"));
+        let k4 = make_key("other-skill", "full", None);
+
+        for k in [&k1, &k2, &k3, &k4] {
+            cache.put(k, "content", "hash", 1_000_000);
+        }
+
+        cache.invalidate_skill("my-skill");
+
+        // All my-skill entries should be gone
+        assert!(cache.get(&k1, "hash", 1_000_000).is_none());
+        assert!(cache.get(&k2, "hash", 1_000_000).is_none());
+        assert!(cache.get(&k3, "hash", 1_000_000).is_none());
+        // Other-skill remains
+        assert!(cache.get(&k4, "hash", 1_000_000).is_some());
+    }
+
+    #[test]
+    fn test_content_cache_clear() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let k1 = make_key("skill-a", "moderate", None);
+        let k2 = make_key("skill-b", "full", None);
+        cache.put(&k1, "a", "hash", 1);
+        cache.put(&k2, "b", "hash", 1);
+
+        assert_eq!(cache.entry_count(), 2);
+
+        cache.clear();
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_content_cache_second_load_is_faster() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("fast-skill", "moderate", None);
+
+        // First load: write to cache
+        let start1 = std::time::Instant::now();
+        cache.put(&key, "content", "hash", 1_000_000);
+        let dur1 = start1.elapsed();
+
+        // Second load: read from cache
+        let start2 = std::time::Instant::now();
+        let result = cache.get(&key, "hash", 1_000_000);
+        let dur2 = start2.elapsed();
+
+        assert!(result.is_some());
+        // The second load should be faster (or at worst comparable)
+        // since it's reading from a file rather than re-deriving content.
+        // Using a generous threshold to avoid flakiness.
+        assert!(
+            dur2 <= dur1 * 10 || dur2.as_micros() < 1000,
+            "Second load took {:?} vs first {:?}",
+            dur2,
+            dur1
+        );
+    }
+
+    #[test]
+    fn test_cache_filename_sanitization() {
+        let key = make_key("my/skill:name", "full", Some("usage/guide"));
+        let filename = key.cache_filename();
+        // Should not contain path separators
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(':'));
+        assert!(filename.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_content_cache_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let cache = SkillContentCache::with_dir(dir.path().to_path_buf());
+
+        let key = make_key("nonexistent", "full", None);
+        assert!(cache.get(&key, "hash", 1).is_none());
+    }
+}

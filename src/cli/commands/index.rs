@@ -351,10 +351,8 @@ fn index_robot(ctx: &AppContext, roots: &[SkillRoot], args: &IndexArgs) -> Resul
     let elapsed = start.elapsed();
 
     let total_companions: usize = skill_files.iter().map(|s| s.companion_count).sum();
-    let skills_with_companions: usize = skill_files
-        .iter()
-        .filter(|s| s.companion_count > 0)
-        .count();
+    let skills_with_companions: usize =
+        skill_files.iter().filter(|s| s.companion_count > 0).count();
 
     println!(
         "{}",
@@ -488,7 +486,7 @@ fn index_skill_file(
     let content = std::fs::read_to_string(&skill.path)?;
 
     // Parse the skill spec
-    let spec = parse_markdown(&content)
+    let mut spec = parse_markdown(&content)
         .map_err(|e| MsError::InvalidSkill(format!("{}: {}", skill.path.display(), e)))?;
 
     if spec.metadata.id.trim().is_empty() {
@@ -497,11 +495,14 @@ fn index_skill_file(
             skill.path.display()
         )));
     }
+    spec.metadata.normalize_ids();
+    canonicalize_non_local_references(&mut spec);
+    let storage_id = spec.storage_id();
 
     // Check if already indexed (unless force)
     let new_hash = compute_spec_hash(&spec)?;
     if !force {
-        if let Ok(Some(existing)) = ctx.db.get_skill(&spec.metadata.id) {
+        if let Ok(Some(existing)) = ctx.db.get_skill(&storage_id) {
             // Check content hash to skip unchanged skills
             let same_layer = existing.source_layer == skill.layer.as_str();
             if existing.content_hash == new_hash && same_layer {
@@ -517,7 +518,7 @@ fn index_skill_file(
     let scorer = crate::quality::QualityScorer::with_defaults();
     let quality = scorer.score_spec(&spec, &crate::quality::QualityContext::default());
     ctx.db
-        .update_skill_quality(&spec.metadata.id, f64::from(quality.overall))?;
+        .update_skill_quality(&storage_id, f64::from(quality.overall))?;
 
     // Resolve the skill if it has inheritance or composition
     let needs_resolution = spec.extends.is_some() || !spec.includes.is_empty();
@@ -526,7 +527,7 @@ fn index_skill_file(
         // Create a hash lookup function that reads skills from git archive and hashes them
         let compute_hash = |skill_id: &str| -> Option<String> {
             // For the current skill, use the already computed hash
-            if skill_id == spec.metadata.id {
+            if skill_id == storage_id {
                 return Some(new_hash.clone());
             }
             // For other skills, read from archive and compute hash
@@ -540,7 +541,7 @@ fn index_skill_file(
         let db_conn = ctx.db.conn();
         let resolved = resolution_cache.get_or_resolve(
             db_conn,
-            &spec.metadata.id,
+            &storage_id,
             &spec,
             repository,
             compute_hash,
@@ -551,7 +552,7 @@ fn index_skill_file(
         ctx.search.index_skill(&resolved_record)?;
     } else {
         // No resolution needed - index the raw spec directly
-        if let Ok(Some(skill_record)) = ctx.db.get_skill(&spec.metadata.id) {
+        if let Ok(Some(skill_record)) = ctx.db.get_skill(&storage_id) {
             ctx.search.index_skill(&skill_record)?;
         }
     }
@@ -585,13 +586,14 @@ fn build_skill_record_from_resolved(
     };
 
     SkillRecord {
-        id: spec.metadata.id.clone(),
+        id: spec.storage_id(),
         name: spec.metadata.name.clone(),
         description: spec.metadata.description.clone(),
         version,
         author: spec.metadata.author.clone(),
         source_path: discovered.path.display().to_string(),
         source_layer: discovered.layer.as_str().to_string(),
+        provider: Some(spec.metadata.provider.clone()),
         git_remote: None,
         git_commit: None,
         content_hash: content_hash.to_string(),
@@ -604,6 +606,8 @@ fn build_skill_record_from_resolved(
         modified_at: chrono::Utc::now().to_rfc3339(),
         is_deprecated: false, // Not tracked in current SkillMetadata
         deprecation_reason: None,
+        archive_format_version: None,
+        provenance_json: "{}".to_string(),
     }
 }
 
@@ -616,6 +620,25 @@ fn compute_spec_hash(spec: &crate::core::SkillSpec) -> Result<String> {
     hasher.update(json.as_bytes());
     let result = hasher.finalize();
     Ok(hex::encode(result))
+}
+
+fn canonicalize_non_local_references(spec: &mut crate::core::SkillSpec) {
+    let provider = spec.metadata.provider_or_default().to_string();
+    if provider == crate::core::ids::DEFAULT_PROVIDER {
+        return;
+    }
+
+    if let Some(parent) = spec.extends.as_mut() {
+        if !parent.contains('/') {
+            *parent = format!("{provider}/{}", parent);
+        }
+    }
+
+    for include in &mut spec.includes {
+        if !include.skill.contains('/') {
+            include.skill = format!("{provider}/{}", include.skill);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1054,7 +1077,14 @@ mod tests {
     fn test_is_skipped_skill_discovery_dir_does_not_skip_legit_names() {
         // Legitimate skill-package directories must not be skipped just
         // because they start with a dot or look like build output.
-        for name in ["scripts", "references", "fixtures", ".github", "src", "tests"] {
+        for name in [
+            "scripts",
+            "references",
+            "fixtures",
+            ".github",
+            "src",
+            "tests",
+        ] {
             assert!(
                 !is_skipped_skill_discovery_dir(name),
                 "did not expect `{name}` to be skipped"

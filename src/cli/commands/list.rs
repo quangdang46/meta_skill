@@ -116,7 +116,7 @@ struct SkillEntry {
 impl From<&SkillRecord> for SkillEntry {
     fn from(s: &SkillRecord) -> Self {
         Self {
-            id: s.id.clone(),
+            id: skill_machine_id(s),
             name: s.name.clone(),
             version: s.version.clone(),
             description: s.description.clone(),
@@ -223,12 +223,25 @@ fn display_list(ctx: &AppContext, skills: &[SkillRecord], args: &ListArgs) -> Re
 }
 
 fn display_list_human(skills: &[SkillRecord], args: &ListArgs) -> Result<()> {
+    use crate::core::detect_collisions;
+
     if skills.is_empty() {
         println!("No skills found");
         println!();
         println!("Index skills with: ms index");
         return Ok(());
     }
+
+    // Detect collisions: same skill-id from different providers
+    let colliding_ids = {
+        let pairs: Vec<(&str, &str)> = skills
+            .iter()
+            .map(|s| (s.provider.as_deref().unwrap_or("local"), s.id.as_str()))
+            .collect();
+        let report = detect_collisions(pairs);
+        // Build set of colliding skill IDs for quick lookup
+        report
+    };
 
     // Print header
     println!(
@@ -246,11 +259,21 @@ fn display_list_human(skills: &[SkillRecord], args: &ListArgs) -> Result<()> {
             String::new()
         };
 
-        // Truncate ID if too long (use char count for UTF-8 safety)
-        let id_display = if skill.id.chars().count() > 38 {
-            format!("{}…", skill.id.chars().take(37).collect::<String>())
+        // Use provider-qualified ID when collisions exist
+        let display_id = if metadata_has_canonical_id(skill) {
+            skill_machine_id(skill)
+        } else if colliding_ids.has(&skill.id) {
+            let provider = skill.provider.as_deref().unwrap_or("local");
+            format!("{}/{}", provider, skill.id)
         } else {
             skill.id.clone()
+        };
+
+        // Truncate ID if too long (use char count for UTF-8 safety)
+        let id_display = if display_id.chars().count() > 38 {
+            format!("{}…", display_id.chars().take(37).collect::<String>())
+        } else {
+            display_id
         };
 
         // Format date - just date part
@@ -289,6 +312,32 @@ fn normalize_layer(input: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+fn skill_machine_id(skill: &SkillRecord) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    metadata
+        .get("canonical_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if let Some(provider) = skill.provider.as_deref() {
+                if provider != "local" {
+                    return format!("{provider}/{}", skill.id);
+                }
+            }
+            skill.id.clone()
+        })
+}
+
+fn metadata_has_canonical_id(skill: &SkillRecord) -> bool {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+    metadata
+        .get("canonical_id")
+        .and_then(|value| value.as_str())
+        .is_some()
 }
 
 /// Check whether the terminal supports rich output for list commands.
@@ -348,6 +397,7 @@ mod tests {
             } else {
                 None
             },
+            ..Default::default()
         }
     }
 
@@ -458,8 +508,7 @@ mod tests {
     #[test]
     fn test_list_plain_output_format() {
         let skill = make_skill("my-skill", "project", false);
-        let tags = if let Ok(meta) =
-            serde_json::from_str::<serde_json::Value>(&skill.metadata_json)
+        let tags = if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&skill.metadata_json)
         {
             meta.get("tags")
                 .and_then(|t| t.as_array())
@@ -478,7 +527,10 @@ mod tests {
             .split('T')
             .next()
             .unwrap_or(&skill.modified_at);
-        let line = format!("{}\t{}\t{}\t{}", skill.name, skill.source_layer, tags, updated);
+        let line = format!(
+            "{}\t{}\t{}\t{}",
+            skill.name, skill.source_layer, tags, updated
+        );
         assert!(line.contains("my-skill"));
         assert!(line.contains("project"));
         assert!(line.contains("cli,rust"));

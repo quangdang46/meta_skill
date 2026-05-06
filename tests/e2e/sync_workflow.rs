@@ -115,10 +115,9 @@ fn sync_report(output: &CommandOutput) -> Result<Value> {
         MsError::ValidationFailed("sync output should contain a reports array".to_string())
     })?;
 
-    reports
-        .first()
-        .cloned()
-        .ok_or_else(|| MsError::ValidationFailed("sync output should include one report".to_string()))
+    reports.first().cloned().ok_or_else(|| {
+        MsError::ValidationFailed("sync output should include one report".to_string())
+    })
 }
 
 fn run_sync_report(
@@ -187,7 +186,10 @@ fn archived_skill_description(archive_root: &Path, skill_id: &str) -> Result<Str
     let raw = fs::read_to_string(&path)
         .map_err(|err| MsError::Config(format!("read archived skill {}: {err}", path.display())))?;
     let json = serde_json::from_str::<Value>(&raw).map_err(|err| {
-        MsError::Config(format!("parse archived skill spec {}: {err}", path.display()))
+        MsError::Config(format!(
+            "parse archived skill spec {}: {err}",
+            path.display()
+        ))
     })?;
     json["metadata"]["description"]
         .as_str()
@@ -223,7 +225,12 @@ fn test_sync_fresh_remote() -> Result<()> {
         ),
         "sync:local_indexed",
     )?;
-    add_filesystem_remote(&mut local, "fresh-remote", &remote.ms_root, "sync:remote_added")?;
+    add_filesystem_remote(
+        &mut local,
+        "fresh-remote",
+        &remote.ms_root,
+        "sync:remote_added",
+    )?;
 
     let report = run_sync_report(
         &mut local,
@@ -266,7 +273,12 @@ fn test_sync_pull_changes() -> Result<()> {
         ),
         "sync:source_indexed",
     )?;
-    add_filesystem_remote(&mut source, "shared-remote", &remote.ms_root, "sync:source_remote")?;
+    add_filesystem_remote(
+        &mut source,
+        "shared-remote",
+        &remote.ms_root,
+        "sync:source_remote",
+    )?;
 
     let push_report = run_sync_report(
         &mut source,
@@ -276,7 +288,12 @@ fn test_sync_pull_changes() -> Result<()> {
     )?;
     assert!(array_contains(&push_report["pushed"], skill_id));
 
-    add_filesystem_remote(&mut target, "shared-remote", &remote.ms_root, "sync:target_remote")?;
+    add_filesystem_remote(
+        &mut target,
+        "shared-remote",
+        &remote.ms_root,
+        "sync:target_remote",
+    )?;
     let pull_report = run_sync_report(
         &mut target,
         &["--robot", "sync", "shared-remote", "--pull-only"],
@@ -353,7 +370,10 @@ fn test_sync_conflict_detection() -> Result<()> {
         "sync:conflict_detected",
     )?;
     assert!(array_contains(&conflict_report["conflicts"], skill_id));
-    assert_eq!(conflict_report["resolved"].as_array().map_or(0, Vec::len), 0);
+    assert_eq!(
+        conflict_report["resolved"].as_array().map_or(0, Vec::len),
+        0
+    );
 
     let status = sync_status_json(&mut local, "sync:conflict_status")?;
     assert_eq!(status["status_counts"]["Conflict"].as_u64(), Some(1));
@@ -459,7 +479,12 @@ fn test_sync_dry_run() -> Result<()> {
         ),
         "sync:local_indexed",
     )?;
-    add_filesystem_remote(&mut local, "dry-remote", &remote.ms_root, "sync:remote_added")?;
+    add_filesystem_remote(
+        &mut local,
+        "dry-remote",
+        &remote.ms_root,
+        "sync:remote_added",
+    )?;
 
     let files_before = walkdir::WalkDir::new(archive_root(&remote))
         .into_iter()
@@ -484,7 +509,10 @@ fn test_sync_dry_run() -> Result<()> {
         .into_iter()
         .filter_map(std::result::Result::ok)
         .count();
-    assert_eq!(files_before, files_after, "dry-run should leave remote files unchanged");
+    assert_eq!(
+        files_before, files_after,
+        "dry-run should leave remote files unchanged"
+    );
 
     let status = sync_status_json(&mut local, "sync:dry_run_status")?;
     assert!(status["last_full_sync"].get("dry-remote").is_none());
@@ -510,7 +538,12 @@ fn test_sync_status_check() -> Result<()> {
         ),
         "sync:local_indexed",
     )?;
-    add_filesystem_remote(&mut local, "status-remote", &remote.ms_root, "sync:remote_added")?;
+    add_filesystem_remote(
+        &mut local,
+        "status-remote",
+        &remote.ms_root,
+        "sync:remote_added",
+    )?;
 
     let report = run_sync_report(
         &mut local,
@@ -590,11 +623,9 @@ fn test_remote_management() -> Result<()> {
     fixture.assert_success(&output, "remote list after remove");
     let list = output.json();
     assert!(
-        list["remotes"]
-            .as_array()
-            .is_some_and(|remotes| remotes.iter().all(|remote| {
-                remote["name"].as_str() != Some("managed-remote")
-            })),
+        list["remotes"].as_array().is_some_and(|remotes| remotes
+            .iter()
+            .all(|remote| { remote["name"].as_str() != Some("managed-remote") })),
         "remote list should not contain removed remotes"
     );
 
@@ -618,7 +649,12 @@ fn test_sync_push_only() -> Result<()> {
         ),
         "sync:local_indexed",
     )?;
-    add_filesystem_remote(&mut local, "push-remote", &remote.ms_root, "sync:remote_added")?;
+    add_filesystem_remote(
+        &mut local,
+        "push-remote",
+        &remote.ms_root,
+        "sync:remote_added",
+    )?;
 
     let report = run_sync_report(
         &mut local,
@@ -655,7 +691,12 @@ fn test_sync_pull_only() -> Result<()> {
         ),
         "sync:remote_indexed",
     )?;
-    add_filesystem_remote(&mut local, "pull-remote", &remote.ms_root, "sync:remote_added")?;
+    add_filesystem_remote(
+        &mut local,
+        "pull-remote",
+        &remote.ms_root,
+        "sync:remote_added",
+    )?;
 
     let report = run_sync_report(
         &mut local,
@@ -667,7 +708,10 @@ fn test_sync_pull_only() -> Result<()> {
     assert_eq!(report["pushed"].as_array().map_or(0, Vec::len), 0);
 
     let description = load_skill_description(&mut local, skill_id)?;
-    assert_eq!(description, "Pull-only content provided by the remote machine");
+    assert_eq!(
+        description,
+        "Pull-only content provided by the remote machine"
+    );
 
     Ok(())
 }
