@@ -764,8 +764,8 @@ fn score_skill(
         // Name or tag match plus some description overlap
         composite.max(0.68)
     } else if keyword_score >= 0.5 {
-        // Keyword match to name or tags alone — modest signal
-        composite.max(0.40)
+        // Keyword match to name or tags — meets default threshold
+        composite.max(0.65)
     } else {
         composite
     };
