@@ -229,9 +229,19 @@ pub(crate) fn route_task(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Deduplicate by skill name across providers: keep highest-scoring only
+    let mut seen_names = std::collections::HashSet::new();
     let above_threshold: Vec<_> = scored
         .iter()
-        .filter(|(_, candidate, _)| candidate.score >= threshold)
+        .filter(|(_, candidate, _)| {
+            if candidate.score < threshold {
+                return false;
+            }
+            // Use skill_id (which includes provider) for identity,
+            // but deduplicate by display_id (skill name) to avoid
+            // same skill from 4 providers filling all slots
+            seen_names.insert(candidate.display_id.clone())
+        })
         .take(top_n)
         .collect();
 
@@ -500,6 +510,42 @@ fn tsv_sanitize(value: &str) -> String {
 // SCORING
 // =============================================================================
 
+/// Check if two words share a common prefix of at least 4 characters.
+/// This handles basic stemming: "profiling" matches "profile", "errors" matches "error", etc.
+fn prefix_fuzzy_match(a: &str, b: &str) -> bool {
+    if a.len() < 4 || b.len() < 4 {
+        return false;
+    }
+    let min_len = a.len().min(b.len());
+    // Check if one starts with the other (for at least 4 chars)
+    if a.len() >= b.len() && &a[..min_len] == b {
+        return true;
+    }
+    if b.len() >= a.len() && &b[..min_len] == a {
+        return true;
+    }
+    // Find common prefix length
+    let common = a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count();
+    common >= 4
+}
+
+/// Check if a word matches any word in text, with prefix fuzzy matching.
+fn word_fuzzy_contains(text: &str, word: &str) -> bool {
+    let text_lower = text.to_lowercase();
+    let word_lower = word.to_lowercase();
+    // Exact substring first
+    if text_lower.contains(&word_lower) {
+        return true;
+    }
+    // Prefix fuzzy: check if word matches any token in text
+    for token in text_lower.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
+        if token.len() >= 4 && prefix_fuzzy_match(&word_lower, token) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Score a skill against a task description.
 fn score_skill(
     skill: &SkillRecord,
@@ -582,12 +628,12 @@ fn score_skill(
             }
             let mut score = 0.0f64;
 
-            // Check name match
+            // Check name match (exact substring)
             if skill.name.to_lowercase().contains(word) {
                 score += 0.5;
             }
-            // Check description match
-            if skill.description.to_lowercase().contains(word) {
+            // Check description match (fuzzy prefix for stemming)
+            if word_fuzzy_contains(&skill.description, word) {
                 score += 0.3;
             }
             // Check tags
@@ -596,7 +642,7 @@ fn score_skill(
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            if tags.iter().any(|t: &&str| t.contains(word)) {
+            if tags.iter().any(|t: &&str| word_fuzzy_contains(t, word)) {
                 score += 0.4;
             }
             if route_keywords.iter().any(|keyword| {
@@ -632,8 +678,14 @@ fn score_skill(
     let keyword_score = if keyword_scores.is_empty() {
         0.0
     } else {
-        keyword_scores.iter().map(|ks| ks.score).sum::<f64>()
-            / (keyword_scores.len() as f64).max(1.0)
+        let sum: f64 = keyword_scores.iter().map(|ks| ks.score).sum();
+        let count = keyword_scores.len() as f64;
+        // Use coverage-weighted average: reward queries where many words match
+        // A single perfect name match (0.5) = 0.5
+        // Three name matches (0.5+0.5+0.5) = 0.5 * (1 + 0.4*2) = 0.9
+        let coverage_bonus = 1.0 + 0.4 * (count - 1.0).max(0.0);
+        let avg = sum / count;
+        (avg * coverage_bonus).min(1.0)
     };
     let route_keyword_score = route_keywords
         .iter()
@@ -672,7 +724,12 @@ fn score_skill(
         .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
         .filter(|w| !w.is_empty() && w.len() > 2)
         .collect();
-    let desc_overlap = task_words.iter().filter(|w| desc_words.contains(w)).count();
+    let desc_overlap = task_words
+        .iter()
+        .filter(|w| {
+            desc_words.contains(w) || desc_words.iter().any(|dw| prefix_fuzzy_match(w, dw))
+        })
+        .count();
     let description_score = if desc_words.is_empty() {
         0.0
     } else {
@@ -686,17 +743,38 @@ fn score_skill(
         + keyword_score * 0.20           // keyword matches in name/description/tags/metadata
         + tag_score * 0.10               // tag relevance
         + description_score * 0.10; // description overlap
+    // Boost composite based on signal strength.
+    // The linear weighted average alone never reaches the threshold for realistic
+    // queries, so we use signal-based boosts to surface relevant skills.
     let composite = if trigger_score >= 1.0 {
         composite.max(0.85)
     } else if trigger_score >= 0.9 {
-        composite.max(0.7)
+        composite.max(0.75)
     } else if route_metadata_score >= 0.95 && keyword_score >= 0.6 {
         // Imported compact route metadata should be authoritative enough to
         // clear the default threshold when it fully covers the task.
-        composite.max(0.7)
+        composite.max(0.72)
+    } else if keyword_score >= 1.0 {
+        // Multiple keyword matches covering name+desc+tags — very strong signal
+        composite.max(0.82)
+    } else if keyword_score >= 0.8 {
+        // Strong keyword match (e.g. name + description)
+        composite.max(0.75)
+    } else if keyword_score >= 0.5 && description_score >= 0.15 {
+        // Name or tag match plus some description overlap
+        composite.max(0.68)
+    } else if keyword_score >= 0.5 {
+        // Keyword match to name or tags alone — modest signal
+        composite.max(0.40)
     } else {
         composite
     };
+
+    // Add a small bonus for the number of distinct keyword matches
+    // so skills matching more of the task words rank higher than those
+    // matching just one word at the same boost level.
+    let match_count_bonus = keyword_scores.len() as f64 * 0.02;
+    let composite = composite + match_count_bonus;
 
     // Don't return candidates with zero score
     if composite <= 0.0 && !debug {
@@ -730,17 +808,7 @@ fn score_skill(
         .get("provider")
         .and_then(|v| v.as_str())
         .unwrap_or("local");
-    let display_id = meta
-        .get("display_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| {
-            if skill.id.contains('/') {
-                skill.id.rsplit('/').next().unwrap_or(&skill.id)
-            } else {
-                &skill.id
-            }
-        })
-        .to_string();
+    let display_id = skill.name.clone();
     let canonical = meta
         .get("canonical_id")
         .and_then(|v| v.as_str())
@@ -1327,6 +1395,8 @@ mod tests {
 
     #[test]
     fn test_canonical_ids_with_collision() {
+        // Same-named skills from different providers get deduplicated:
+        // only the highest-scoring one appears.
         let skill_a = SkillRecord {
             metadata_json: serde_json::json!({
                 "provider": "claude",
@@ -1358,21 +1428,15 @@ mod tests {
         };
         let response = route_task(vec![skill_a, skill_b], "shared id task", 3, 0.65, false);
         assert_eq!(response.decision, "match");
-        assert_eq!(response.candidates.len(), 2);
-        let ids: Vec<_> = response
-            .candidates
-            .iter()
-            .map(|c| c.skill_id.clone())
-            .collect();
-        assert!(ids.contains(&"claude/shared-id".to_string()));
-        assert!(ids.contains(&"codex/shared-id".to_string()));
-        for cand in &response.candidates {
-            assert!(
-                cand.load_command.contains(&cand.skill_id),
-                "load_command should use canonical skill_id: {}",
-                cand.load_command
-            );
-        }
+        // Dedup by name keeps only 1 (same name "Shared" from two providers)
+        assert_eq!(response.candidates.len(), 1);
+        // The canonical skill_id is used in load_command
+        let cand = &response.candidates[0];
+        assert!(
+            cand.load_command.contains(&cand.skill_id),
+            "load_command should use canonical skill_id: {}",
+            cand.load_command
+        );
     }
 
     #[test]
