@@ -833,7 +833,10 @@ fn score_skill(
     } else {
         String::new()
     };
-    let load_command = format!("ms load {}{} -O json", skill_id, entry_section_str);
+    // Use skill.id (DB primary key) for load_command because resolve_skill
+    // looks up by DB id first. Canonical IDs with provider prefix may not exist in DB.
+    let load_ref = skill.id.clone();
+    let load_command = format!("ms load {}{} -O json", load_ref, entry_section_str);
 
     let default_load = if !entry_sections.is_empty() {
         format!("section:{}", entry_sections[0])
@@ -1191,11 +1194,12 @@ mod tests {
 
         let candidate = &response.candidates[0];
         assert_eq!(candidate.skill_id, "agents/common-name");
+        // load_command uses skill.id (DB primary key) so resolve_skill can find it
         assert_eq!(
             candidate.load_command,
-            "ms load agents/common-name --section checklist -O json"
+            "ms load common-name --section checklist -O json"
         );
-        assert!(candidate.load_command.contains(&candidate.skill_id));
+        assert!(candidate.load_command.contains("common-name"));
     }
 
     #[test]
